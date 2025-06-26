@@ -59,6 +59,7 @@ The easiest way to use DaveSaveEd is to download the pre-compiled executable.
 * **Modifications (especially Gold, Bei, Artisan's Flame, or Follower Count) are not visible in-game even after writing the save:**
     * **Incorrect Save File:** The game typically uses `GameSave_00_GD.sav` as its current save. Ensure you loaded and modified this file, and not an older one like `m_GameSave_01_GD.sav`. The "Load Save File..." dialog pre-selects the latest active save; generally, you should just click "Open" after launching it.
     * **Early Game Scripting:** During the game's initial tutorial phases (e.g., Day 1, before you repair the sushi bar or unlock the full restaurant management system), certain values like Gold or Follower Count are hard-scripted and may override changes you make in the save file. For example, your gold will remain -100 until the sushi bar quest is completed. We recommend progressing past these initial scripted sequences before expecting your modifications to take full effect.
+    * **Modded changes not visible**: You might need to temporarily disable cloud saves for the game (Thanks BlasianX27)
     * Always check the `DaveSaveEd.log` file (run with `-log` as described above) for detailed operation reports.
 ---
 
