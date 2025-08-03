@@ -47,7 +47,7 @@ public:
     bool LoadSaveFile(const std::string& filepath);
     bool WriteSaveFile(std::string& out_backup_filepath);
 
-    // Player Stats Getters (already exists, but ensures it can access m_saveData)
+    // Player Stats Getters
     long long GetGold() const;
     long long GetBei() const;
     long long GetArtisansFlame() const;
@@ -60,36 +60,32 @@ public:
     void SetArtisansFlame(long long value);
     void SetFollowerCount(long long value);
 
-    // Ingredient Modification Functions (these are new or will be expanded)
-    void MaxOwnIngredients(sqlite3* db); // Needs access to the database
-    void MaxAllIngredients(sqlite3* db); // Needs access to the database
+    // Ingredient Modification Functions
+    void MaxOwnIngredients(sqlite3* db);
+    void MaxAllIngredients(sqlite3* db);
 
-    // Static helper to find save directory (already exists)
+    // Static helper to find save directory
     static std::filesystem::path GetDefaultSaveGameDirectoryAndLatestFile(std::string& latestSaveFileName);
 
 private:
     // --- Member Variables ---
-    nlohmann::json m_saveData;           // Holds the parsed JSON data of the save file.
-    std::string m_currentSaveFilePath;   // Path of the currently loaded save file.
-    bool m_isSaveFileLoaded;             // Flag to indicate if a save file is successfully loaded.
+    nlohmann::json m_saveData;
+    std::string m_currentSaveFilePath;
+    bool m_isSaveFileLoaded;
 
     // --- Private Helper Methods ---
-    // XOR encryption/decryption (already exists, but ensure it's private if it's not a static utility)
-    std::string XORDecryptEncrypt(const std::string& data, const std::string& key);
+    // The hybrid XOR function for robust encryption/decryption.
+    std::string XORHybrid(const std::string& data, const std::string& key);
 
-    // Zlib decompression (will be moved from DaveSaveEd.cpp and integrated with XOR)
+    // Encoding conversion helper to ensure JSON parser receives valid UTF-8.
+    std::string Latin1ToUTF8(const std::string& latin1_str);
+
+    // Zlib compression/decompression helpers
     std::string decompressZlib(const std::vector<unsigned char>& compressed_bytes);
-    // Zlib compression (will be moved from DaveSaveEd.cpp and integrated with XOR)
     std::vector<unsigned char> compressZlib(const std::string& uncompressed_json);
 
-    // SQLite Callback for batch querying ingredients (for MaxAllIngredients)
-    // This will need to be a static member function or a friend function
-    // due to how sqlite3_exec callbacks work, or a lambda in C++11+
-    // For now, let's keep it as a free function or make it static in SaveGameManager.cpp
-    // and just declare it here.
-    // For simplicity, let's keep it in SaveGameManager.cpp's private section for now.
-    // static int callbackGetAllIngredients(void* data, int argc, char** argv, char** azColName);
-
-    // Constant for the XOR key (replace with your actual key)
-    const std::string XOR_KEY = "GameData"; // <-- **IMPORTANT: Replace with your actual key!**
+    // Constant for the XOR key
+    const std::string XOR_KEY = "GameData";
 };
+
+//END OF SaveGameManager.h

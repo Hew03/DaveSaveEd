@@ -48,6 +48,7 @@
 #include <filesystem>    // Required for std::filesystem::path, create_directories, copy, last_write_time
 
 // --- Global Constants for SaveGameManager ---
+// Note: XOR_KEY is defined in SaveGameManager.h
 // Use long long for currency to avoid overflow
 const long long SAVE_MAX_CURRENCY = 999999999LL;
 
@@ -61,19 +62,78 @@ SaveGameManager::~SaveGameManager() {
     LogMessage(LOG_INFO_LEVEL, "SaveGameManager shutting down.");
 }
 
-// Applies XOR encryption/decryption to a string using a specified key.
-// The same function is used for both encryption and decryption.
-std::string SaveGameManager::XORDecryptEncrypt(const std::string& data, const std::string& key) {
-    std::string result = data;
+// --- HYBRID XOR FUNCTION ---
+// Author: FNGarvin & Gemini
+// License: Public Domain
+//
+// Performs a repeating-key XOR using a hybrid algorithm to handle the
+// specific bug in the save files robustly and reversibly.
+// If a decrypted byte would have its high bit set (value >= 128), it's
+// treated as the start of a 4-byte block. This block is XORed, but the
+// key index is advanced by a different amount to correct synchronization.
+std::string SaveGameManager::XORHybrid(const std::string& data, const std::string& key) {
+    std::string output;
+    output.reserve(data.length());
+
+    size_t data_idx = 0;
+    size_t key_idx = 0;
     size_t key_len = key.length();
-    for (size_t i = 0; i < data.length(); ++i) {
-        result[i] = data[i] ^ key[i % key_len];
+
+    while (data_idx < data.length()) {
+        // Peek ahead by decrypting the current byte to check its value.
+        unsigned char peek_key_byte = key[key_idx % key_len];
+        unsigned char decrypted_peek = static_cast<unsigned char>(data[data_idx]) ^ peek_key_byte;
+
+        // Check if the decrypted byte would have the high bit set.
+        if (decrypted_peek >= 128) {
+            // --- Special 4-Byte Block Case ---
+            size_t block_len = 4;
+            size_t block_end = std::min(data_idx + block_len, data.length());
+
+            // Process the 4-byte block by XORing each byte.
+            for (size_t i = 0; i < (block_end - data_idx); ++i) {
+                unsigned char current_key_byte = key[(key_idx + i) % key_len];
+                output += data[data_idx + i] ^ current_key_byte;
+            }
+
+            // Advance the data pointer by 4.
+            data_idx += (block_end - data_idx);
+            // Advance the key index by 3 to correct the synchronization.
+            key_idx += 3;
+        } else {
+            // --- Standard XOR Case ---
+            // The decrypted byte is standard ASCII, so we append it.
+            output += decrypted_peek;
+            data_idx += 1;
+            key_idx += 1;
+        }
     }
-    return result;
+    return output;
 }
 
+// --- ENCODING HELPER ---
+// Converts a string of bytes (interpreted as Latin-1) to a valid UTF-8 string.
+// This is necessary because the nlohmann::json parser strictly requires UTF-8 input.
+std::string SaveGameManager::Latin1ToUTF8(const std::string& latin1_str) {
+    std::string utf8_str;
+    utf8_str.reserve(latin1_str.length()); // Reserve initial size, it will grow
+
+    for (unsigned char c : latin1_str) {
+        if (c < 0x80) {
+            // ASCII characters (0-127) are the same in UTF-8.
+            utf8_str += c;
+        } else {
+            // Latin-1 characters (128-255) correspond to Unicode U+0080 to U+00FF.
+            // These are represented by a 2-byte sequence in UTF-8.
+            utf8_str += (0xC0 | (c >> 6));            // First byte: 110xxxxx
+            utf8_str += (0x80 | (c & 0x3F));          // Second byte: 10xxxxxx
+        }
+    }
+    return utf8_str;
+}
+
+
 // --- Zlib Decompression Implementation ---
-// This function is for decompressing the embedded SQLite database, not the save file itself.
 std::string SaveGameManager::decompressZlib(const std::vector<unsigned char>& compressed_bytes) {
     z_stream strm;
     strm.zalloc = Z_NULL;
@@ -110,7 +170,6 @@ std::string SaveGameManager::decompressZlib(const std::vector<unsigned char>& co
 }
 
 // --- Zlib Compression Implementation ---
-// This function is for compressing the embedded SQLite database, not the save file itself.
 std::vector<unsigned char> SaveGameManager::compressZlib(const std::string& uncompressed_data) {
     z_stream strm;
     strm.zalloc = Z_NULL;
@@ -143,15 +202,15 @@ std::vector<unsigned char> SaveGameManager::compressZlib(const std::string& unco
 }
 
 
-// --- LoadSaveFile Implementation ---
+// --- LoadSaveFile Implementation (Updated) ---
 bool SaveGameManager::LoadSaveFile(const std::string& filepath) {
     LogMessage(LOG_INFO_LEVEL, ("Attempting to load save file: " + filepath).c_str());
     m_isSaveFileLoaded = false;
     m_currentSaveFilePath = "";
-    m_saveData = nlohmann::json(); // Clear any previously loaded data
+    m_saveData = nlohmann::json();
 
     try {
-        // 1. Read the raw XOR-encrypted bytes from the file
+        // 1. Read the raw encrypted bytes from the file
         std::ifstream input_file(filepath, std::ios::binary);
         if (!input_file) {
             LogMessage(LOG_ERROR_LEVEL, ("Could not open save file for reading: " + filepath).c_str());
@@ -161,19 +220,23 @@ bool SaveGameManager::LoadSaveFile(const std::string& filepath) {
         input_file.close();
         LogMessage(LOG_INFO_LEVEL, ("Read " + std::to_string(xor_encrypted_bytes.size()) + " bytes from file.").c_str());
 
-        // 2. XOR decrypt the bytes to get the raw JSON string
-        std::string json_str = XORDecryptEncrypt(std::string(xor_encrypted_bytes.begin(), xor_encrypted_bytes.end()), XOR_KEY);
-        LogMessage(LOG_INFO_LEVEL, "XOR decrypted save file. Data is now raw JSON.");
+        // 2. XOR decrypt the bytes to get the raw JSON string (as Latin-1 bytes)
+        std::string json_str_latin1 = XORHybrid(std::string(xor_encrypted_bytes.begin(), xor_encrypted_bytes.end()), XOR_KEY);
+        LogMessage(LOG_INFO_LEVEL, "XOR decrypted save file.");
 
-        // 3. Parse the JSON string
-        m_saveData = nlohmann::json::parse(json_str);
+        // 3. Convert the Latin-1 byte string to a valid UTF-8 string
+        std::string json_str_utf8 = Latin1ToUTF8(json_str_latin1);
+        LogMessage(LOG_INFO_LEVEL, "Converted byte stream to UTF-8 for parsing.");
+
+        // 4. Parse the now-valid UTF-8 JSON string
+        m_saveData = nlohmann::json::parse(json_str_utf8);
         m_currentSaveFilePath = filepath;
         m_isSaveFileLoaded = true;
         LogMessage(LOG_INFO_LEVEL, "Save file JSON parsed successfully.");
         return true;
 
     } catch (const nlohmann::json::parse_error& e) {
-        LogMessage(LOG_ERROR_LEVEL, ("JSON parse error during load: " + std::string(e.what())).c_str());
+        LogMessage(LOG_ERROR_LEVEL, ("JSON parse error during load: " + std::string(e.what()) + " at byte " + std::to_string(e.byte)).c_str());
     } catch (const std::runtime_error& e) {
         LogMessage(LOG_ERROR_LEVEL, ("Runtime error during load: " + std::string(e.what())).c_str());
     } catch (const std::exception& e) {
@@ -182,10 +245,8 @@ bool SaveGameManager::LoadSaveFile(const std::string& filepath) {
     return false;
 }
 
-// --- WriteSaveFile Implementation ---
-// Modified to return the backup file path on success via an output parameter.
+// --- WriteSaveFile Implementation (Updated) ---
 bool SaveGameManager::WriteSaveFile(std::string& out_backup_filepath) {
-    // Clear the output path initially, in case of failure.
     out_backup_filepath.clear();
 
     if (!m_isSaveFileLoaded || m_currentSaveFilePath.empty()) {
@@ -196,24 +257,23 @@ bool SaveGameManager::WriteSaveFile(std::string& out_backup_filepath) {
     LogMessage(LOG_INFO_LEVEL, ("Attempting to write save file: " + m_currentSaveFilePath).c_str());
     try {
         std::filesystem::path original_path(m_currentSaveFilePath);
-        std::filesystem::path backup_dir; // Declare backup_dir here
+        std::filesystem::path backup_dir;
 
-        // Get system temporary path using Windows API
         WCHAR tempPathBuffer[MAX_PATH];
         DWORD length = GetTempPathW(MAX_PATH, tempPathBuffer);
         if (length == 0 || length > MAX_PATH) {
             LogMessage(LOG_ERROR_LEVEL, "Failed to get system temporary path. Falling back to save directory backup.");
-            backup_dir = original_path.parent_path() / "backups"; // Fallback to old behavior
+            backup_dir = original_path.parent_path() / "backups";
         } else {
             std::filesystem::path base_temp_path = tempPathBuffer;
-            backup_dir = base_temp_path / "DaveSaveEd_Backups"; // Create a specific subfolder for backups
+            backup_dir = base_temp_path / "DaveSaveEd_Backups";
         }
-        std::filesystem::create_directories(backup_dir); // Ensure the chosen backup directory exists
+        std::filesystem::create_directories(backup_dir);
 
         auto now = std::chrono::system_clock::now();
         std::time_t now_c = std::chrono::system_clock::to_time_t(now);
         std::tm tm_buf;
-        localtime_s(&tm_buf, &now_c); // Use localtime_s for thread safety on Windows
+        localtime_s(&tm_buf, &now_c);
 
         std::stringstream ss;
         ss << std::put_time(&tm_buf, "%Y%m%d_%H%M%S");
@@ -222,21 +282,20 @@ bool SaveGameManager::WriteSaveFile(std::string& out_backup_filepath) {
         std::string backup_filename = original_path.stem().string() + "_" + timestamp + original_path.extension().string();
         std::filesystem::path backup_path = backup_dir / backup_filename;
 
-        // Copy original file to backup location
         std::filesystem::copy(original_path, backup_path, std::filesystem::copy_options::overwrite_existing);
         LogMessage(LOG_INFO_LEVEL, ("Original save file backed up to: " + backup_path.string()).c_str());
 
-        // 2. Serialize the modified JSON data to a string
-        std::string json_to_write_str = m_saveData.dump(); // No pretty printing for smaller size
-        LogMessage(LOG_INFO_LEVEL, "Serialized JSON data.");
+        // Serialize JSON to a pure ASCII string, escaping all non-ASCII characters.
+        // This is the safest way to ensure the output is clean before encryption.
+        std::string json_to_write_str = m_saveData.dump(-1, ' ', true);
+        LogMessage(LOG_INFO_LEVEL, "Serialized JSON data to ASCII string.");
 
-        // 3. XOR encrypt the JSON string
-        std::string xor_encrypted_str = XORDecryptEncrypt(json_to_write_str, XOR_KEY);
+        // XOR encrypt the JSON string using the hybrid logic
+        std::string xor_encrypted_str = XORHybrid(json_to_write_str, XOR_KEY);
         std::vector<unsigned char> final_bytes(xor_encrypted_str.begin(), xor_encrypted_str.end());
         LogMessage(LOG_INFO_LEVEL, "XOR encrypted JSON data.");
 
-        // 4. Write the final bytes to the original save file path
-        std::ofstream output_file(m_currentSaveFilePath, std::ios::binary | std::ios::trunc); // trunc to overwrite
+        std::ofstream output_file(m_currentSaveFilePath, std::ios::binary | std::ios::trunc);
         if (!output_file) {
             LogMessage(LOG_ERROR_LEVEL, ("Could not open save file for writing: " + m_currentSaveFilePath).c_str());
             return false;
@@ -244,17 +303,16 @@ bool SaveGameManager::WriteSaveFile(std::string& out_backup_filepath) {
         output_file.write(reinterpret_cast<const char*>(final_bytes.data()), final_bytes.size());
         output_file.close();
         
-        // On success, populate the output parameter with the backup file path
         out_backup_filepath = backup_path.string();
         LogMessage(LOG_INFO_LEVEL, ("Modified save file written successfully to: " + m_currentSaveFilePath).c_str());
         return true;
 
     } catch (const std::exception& e) {
         LogMessage(LOG_ERROR_LEVEL, ("Error writing save file: " + std::string(e.what())).c_str());
-        // out_backup_filepath remains empty, as set at the beginning.
         return false;
     }
 }
+
 
 // --- Player Stats Getters ---
 long long SaveGameManager::GetGold() const {
@@ -588,8 +646,12 @@ std::filesystem::path SaveGameManager::GetDefaultSaveGameDirectoryAndLatestFile(
         for (const auto& entry : std::filesystem::directory_iterator(steamIDPath)) {
             if (entry.is_regular_file()) {
                 std::string fileName = entry.path().filename().string();
-                if (fileName.length() > 10 && fileName.substr(0, 8) == "GameSave" &&
-                    fileName.substr(fileName.length() - 7) == "_GD.sav") {
+                
+                // *** CHANGED: Updated logic to detect both auto and manual save files ***
+                bool is_autosave = (fileName.length() > 10 && fileName.substr(0, 8) == "GameSave" && fileName.substr(fileName.length() - 7) == "_GD.sav");
+                bool is_manual_save = (fileName.length() > 2 && fileName.substr(0, 2) == "m_" && fileName.substr(fileName.length() - 4) == ".sav");
+
+                if (is_autosave || is_manual_save) {
                     try {
                         auto fileTime = std::filesystem::last_write_time(entry.path());
                         if (mostRecentSaveFile.empty() || fileTime > lastWriteTime) {
@@ -608,11 +670,10 @@ std::filesystem::path SaveGameManager::GetDefaultSaveGameDirectoryAndLatestFile(
         latestSaveFileName = mostRecentSaveFile.string();
         LogMessage(LOG_INFO_LEVEL, (std::string("Identified most recent save file: ") + latestSaveFileName).c_str());
     } else {
-        LogMessage(LOG_INFO_LEVEL, (std::string("No GameSave_XX_GD.sav files found in " + steamIDPath.string())).c_str());
+        LogMessage(LOG_INFO_LEVEL, (std::string("No valid save files found in " + steamIDPath.string())).c_str());
         latestSaveFileName.clear();
     }
 
     return steamIDPath;
 }
-
-
+//END OF SaveGameManager.cpp
