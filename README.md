@@ -40,7 +40,7 @@ The easiest way to use DaveSaveEd is to download the pre-compiled executable.
 ## How to Use
 ::TODO::Create an animation of our app as a cursor moves to and clicks on the max bei option and display it here.
 1.  **Launch `DaveSaveEd.exe`**.
-2.  **Load Save File:** Click "Load Save File..." The editor will attempt to automatically locate your game's save directory and pre-select the most recent save file.
+2.  **Load Save File:** Click "Load Save File..." The editor will attempt to automatically locate your game's save directory and pre-select the most recent save file (`GameSave_00_GD.sav`). **It's crucial to load this specific file.** Unless you explicitly intend to modify an older, inactive save, simply click "Open" without changing the pre-filled filename.
 3.  **Modify Values:** Use the "Set to Max" buttons for currency or the ingredient modification buttons to apply changes.
 4.  **Write Save File:** Click "Write Save File" to save your changes. A backup of your original save will be automatically created in temporary storage, in case you need to revert.
 
@@ -56,7 +56,11 @@ The easiest way to use DaveSaveEd is to download the pre-compiled executable.
     * Always ensure you're using the latest version of the editor.
     * Report issues on the GitHub issue tracker.
 * **In-game issues after modifying**: Restore from a backup. The editor creates timestamped backups in a `backups` folder next to your save file.
-
+* **Modifications (especially Gold, Bei, Artisan's Flame, or Follower Count) are not visible in-game even after writing the save:**
+    * **Incorrect Save File:** The game typically uses `GameSave_00_GD.sav` as its current save. Ensure you loaded and modified this file, and not an older one like `m_GameSave_01_GD.sav`. The "Load Save File..." dialog pre-selects the latest active save; generally, you should just click "Open" after launching it.
+    * **Early Game Scripting:** During the game's initial tutorial phases (e.g., Day 1, before you repair the sushi bar or unlock the full restaurant management system), certain values like Gold or Follower Count are hard-scripted and may override changes you make in the save file. For example, your gold will remain -100 until the sushi bar quest is completed. We recommend progressing past these initial scripted sequences before expecting your modifications to take full effect.
+    * **Modded changes not visible**: You might need to temporarily disable cloud saves for the game (Thanks BlasianX27)
+    * Always check the `DaveSaveEd.log` file (run with `-log` as described above) for detailed operation reports.
 ---
 
 ## Building from Source (For Developers)
