@@ -75,10 +75,12 @@ private:
 
     // --- Private Helper Methods ---
     // The hybrid XOR function for robust encryption/decryption.
-    std::string XORHybrid(const std::string& data, const std::string& key);
+    // *** CHANGED: Now operates on vectors of unsigned char for safety. ***
+    std::vector<unsigned char> XORHybrid(const std::vector<unsigned char>& data, const std::string& key);
 
-    // Encoding conversion helper to ensure JSON parser receives valid UTF-8.
-    std::string Latin1ToUTF8(const std::string& latin1_str);
+    // Encoding conversion helpers to ensure JSON parser receives valid UTF-8 and can be saved back correctly.
+    std::string Latin1ToUTF8(const std::vector<unsigned char>& latin1_bytes);
+    std::vector<unsigned char> UTF8ToLatin1(const std::string& utf8_str);
 
     // Zlib compression/decompression helpers
     std::string decompressZlib(const std::vector<unsigned char>& compressed_bytes);
@@ -89,3 +91,4 @@ private:
 };
 
 //END OF SaveGameManager.h
+

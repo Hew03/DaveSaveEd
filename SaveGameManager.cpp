@@ -62,48 +62,63 @@ SaveGameManager::~SaveGameManager() {
     LogMessage(LOG_INFO_LEVEL, "SaveGameManager shutting down.");
 }
 
-// --- HYBRID XOR FUNCTION ---
-// Author: FNGarvin & Gemini
-// License: Public Domain
-//
-// Performs a repeating-key XOR using a hybrid algorithm to handle the
-// specific bug in the save files robustly and reversibly.
-// If a decrypted byte would have its high bit set (value >= 128), it's
-// treated as the start of a 4-byte block. This block is XORed, but the
-// key index is advanced by a different amount to correct synchronization.
-std::string SaveGameManager::XORHybrid(const std::string& data, const std::string& key) {
-    std::string output;
-    output.reserve(data.length());
+// --- HYBRID XOR FUNCTION (Updated with Triage Logic and vector<unsigned char>) ---
+std::vector<unsigned char> SaveGameManager::XORHybrid(const std::vector<unsigned char>& data, const std::string& key) {
+    std::vector<unsigned char> output;
+    output.reserve(data.size());
 
     size_t data_idx = 0;
     size_t key_idx = 0;
     size_t key_len = key.length();
 
-    while (data_idx < data.length()) {
-        // Peek ahead by decrypting the current byte to check its value.
+    while (data_idx < data.size()) {
         unsigned char peek_key_byte = key[key_idx % key_len];
-        unsigned char decrypted_peek = static_cast<unsigned char>(data[data_idx]) ^ peek_key_byte;
+        unsigned char decrypted_peek = data[data_idx] ^ peek_key_byte;
 
-        // Check if the decrypted byte would have the high bit set.
         if (decrypted_peek >= 128) {
-            // --- Special 4-Byte Block Case ---
-            size_t block_len = 4;
-            size_t block_end = std::min(data_idx + block_len, data.length());
-
-            // Process the 4-byte block by XORing each byte.
-            for (size_t i = 0; i < (block_end - data_idx); ++i) {
-                unsigned char current_key_byte = key[(key_idx + i) % key_len];
-                output += data[data_idx + i] ^ current_key_byte;
+            // --- Special Block Case ---
+            // Check the next 4 bytes to determine the bug pattern
+            size_t block_len_check = 4;
+            size_t block_end_check = std::min(data_idx + block_len_check, data.size());
+            
+            int high_bit_count = 0;
+            for (size_t i = 0; i < (block_end_check - data_idx); ++i) {
+                unsigned char check_key_byte = key[(key_idx + i) % key_len];
+                unsigned char decrypted_check = data[data_idx + i] ^ check_key_byte;
+                if (decrypted_check >= 128) {
+                    ++high_bit_count;
+                }
             }
 
-            // Advance the data pointer by 4.
-            data_idx += (block_end - data_idx);
-            // Advance the key index by 3 to correct the synchronization.
-            key_idx += 3;
+            // Determine the correct data block length and key advancement based on the pattern
+            size_t block_len_process;
+            size_t key_advancement;
+
+            if (high_bit_count == 4) {
+                // This is the "UTF-8 sequence" bug. Process 6 data bytes, advance key by 4.
+                block_len_process = 6;
+                key_advancement = 4;
+            } else {
+                // This is the "legacy codepage" bug. Process 4 data bytes, advance key by 3.
+                block_len_process = 4;
+                key_advancement = 3;
+            }
+
+            LogMessage(LOG_INFO_LEVEL, ("High-bit block detected (" + std::to_string(high_bit_count) + "/4). Processing " + std::to_string(block_len_process) + " bytes, advancing key by " + std::to_string(key_advancement) + ".").c_str());
+            
+            // Process the determined number of bytes
+            size_t block_end_process = std::min(data_idx + block_len_process, data.size());
+            for (size_t i = 0; i < (block_end_process - data_idx); ++i) {
+                unsigned char current_key_byte = key[(key_idx + i) % key_len];
+                output.push_back(data[data_idx + i] ^ current_key_byte);
+            }
+
+            data_idx += (block_end_process - data_idx);
+            key_idx += key_advancement;
+
         } else {
             // --- Standard XOR Case ---
-            // The decrypted byte is standard ASCII, so we append it.
-            output += decrypted_peek;
+            output.push_back(decrypted_peek);
             data_idx += 1;
             key_idx += 1;
         }
@@ -111,25 +126,47 @@ std::string SaveGameManager::XORHybrid(const std::string& data, const std::strin
     return output;
 }
 
-// --- ENCODING HELPER ---
-// Converts a string of bytes (interpreted as Latin-1) to a valid UTF-8 string.
-// This is necessary because the nlohmann::json parser strictly requires UTF-8 input.
-std::string SaveGameManager::Latin1ToUTF8(const std::string& latin1_str) {
+// --- ENCODING HELPERS ---
+std::string SaveGameManager::Latin1ToUTF8(const std::vector<unsigned char>& latin1_bytes) {
     std::string utf8_str;
-    utf8_str.reserve(latin1_str.length()); // Reserve initial size, it will grow
+    utf8_str.reserve(latin1_bytes.size());
 
-    for (unsigned char c : latin1_str) {
+    for (unsigned char c : latin1_bytes) {
         if (c < 0x80) {
-            // ASCII characters (0-127) are the same in UTF-8.
             utf8_str += c;
         } else {
-            // Latin-1 characters (128-255) correspond to Unicode U+0080 to U+00FF.
-            // These are represented by a 2-byte sequence in UTF-8.
-            utf8_str += (0xC0 | (c >> 6));            // First byte: 110xxxxx
-            utf8_str += (0x80 | (c & 0x3F));          // Second byte: 10xxxxxx
+            utf8_str += (0xC0 | (c >> 6));
+            utf8_str += (0x80 | (c & 0x3F));
         }
     }
     return utf8_str;
+}
+
+std::vector<unsigned char> SaveGameManager::UTF8ToLatin1(const std::string& utf8_str) {
+    std::vector<unsigned char> latin1_bytes;
+    latin1_bytes.reserve(utf8_str.length());
+
+    for (size_t i = 0; i < utf8_str.length(); ) {
+        unsigned char c = utf8_str[i];
+        if (c < 0x80) {
+            latin1_bytes.push_back(c);
+            i++;
+        } else if ((c & 0xE0) == 0xC0) {
+            if (i + 1 < utf8_str.length()) {
+                unsigned char c2 = utf8_str[i + 1];
+                unsigned char original_char = ((c & 0x1F) << 6) | (c2 & 0x3F);
+                latin1_bytes.push_back(original_char);
+                i += 2;
+            } else {
+                latin1_bytes.push_back('?');
+                i++;
+            }
+        } else {
+            latin1_bytes.push_back('?');
+            i++;
+        }
+    }
+    return latin1_bytes;
 }
 
 
@@ -210,7 +247,6 @@ bool SaveGameManager::LoadSaveFile(const std::string& filepath) {
     m_saveData = nlohmann::json();
 
     try {
-        // 1. Read the raw encrypted bytes from the file
         std::ifstream input_file(filepath, std::ios::binary);
         if (!input_file) {
             LogMessage(LOG_ERROR_LEVEL, ("Could not open save file for reading: " + filepath).c_str());
@@ -220,15 +256,12 @@ bool SaveGameManager::LoadSaveFile(const std::string& filepath) {
         input_file.close();
         LogMessage(LOG_INFO_LEVEL, ("Read " + std::to_string(xor_encrypted_bytes.size()) + " bytes from file.").c_str());
 
-        // 2. XOR decrypt the bytes to get the raw JSON string (as Latin-1 bytes)
-        std::string json_str_latin1 = XORHybrid(std::string(xor_encrypted_bytes.begin(), xor_encrypted_bytes.end()), XOR_KEY);
+        std::vector<unsigned char> json_bytes_latin1 = XORHybrid(xor_encrypted_bytes, XOR_KEY);
         LogMessage(LOG_INFO_LEVEL, "XOR decrypted save file.");
 
-        // 3. Convert the Latin-1 byte string to a valid UTF-8 string
-        std::string json_str_utf8 = Latin1ToUTF8(json_str_latin1);
+        std::string json_str_utf8 = Latin1ToUTF8(json_bytes_latin1);
         LogMessage(LOG_INFO_LEVEL, "Converted byte stream to UTF-8 for parsing.");
 
-        // 4. Parse the now-valid UTF-8 JSON string
         m_saveData = nlohmann::json::parse(json_str_utf8);
         m_currentSaveFilePath = filepath;
         m_isSaveFileLoaded = true;
@@ -236,7 +269,9 @@ bool SaveGameManager::LoadSaveFile(const std::string& filepath) {
         return true;
 
     } catch (const nlohmann::json::parse_error& e) {
-        LogMessage(LOG_ERROR_LEVEL, ("JSON parse error during load: " + std::string(e.what()) + " at byte " + std::to_string(e.byte)).c_str());
+        std::stringstream ss;
+        ss << "0x" << std::hex << e.byte;
+        LogMessage(LOG_ERROR_LEVEL, ("JSON parse error during load: " + std::string(e.what()) + " at offset " + ss.str()).c_str());
     } catch (const std::runtime_error& e) {
         LogMessage(LOG_ERROR_LEVEL, ("Runtime error during load: " + std::string(e.what())).c_str());
     } catch (const std::exception& e) {
@@ -285,14 +320,13 @@ bool SaveGameManager::WriteSaveFile(std::string& out_backup_filepath) {
         std::filesystem::copy(original_path, backup_path, std::filesystem::copy_options::overwrite_existing);
         LogMessage(LOG_INFO_LEVEL, ("Original save file backed up to: " + backup_path.string()).c_str());
 
-        // Serialize JSON to a pure ASCII string, escaping all non-ASCII characters.
-        // This is the safest way to ensure the output is clean before encryption.
-        std::string json_to_write_str = m_saveData.dump(-1, ' ', true);
-        LogMessage(LOG_INFO_LEVEL, "Serialized JSON data to ASCII string.");
+        std::string json_to_write_utf8 = m_saveData.dump();
+        LogMessage(LOG_INFO_LEVEL, "Serialized JSON data to UTF-8 string.");
+        
+        std::vector<unsigned char> json_bytes_latin1 = UTF8ToLatin1(json_to_write_utf8);
+        LogMessage(LOG_INFO_LEVEL, "Converted UTF-8 string to Latin-1 bytes for encryption.");
 
-        // XOR encrypt the JSON string using the hybrid logic
-        std::string xor_encrypted_str = XORHybrid(json_to_write_str, XOR_KEY);
-        std::vector<unsigned char> final_bytes(xor_encrypted_str.begin(), xor_encrypted_str.end());
+        std::vector<unsigned char> final_bytes = XORHybrid(json_bytes_latin1, XOR_KEY);
         LogMessage(LOG_INFO_LEVEL, "XOR encrypted JSON data.");
 
         std::ofstream output_file(m_currentSaveFilePath, std::ios::binary | std::ios::trunc);
@@ -385,8 +419,7 @@ void SaveGameManager::SetFollowerCount(long long value) {
 // Helper function to determine the target count based on the item's MaxCount from DB
 static int GetDesiredMaxCountForTier(int item_db_max_count) {
     if (item_db_max_count == 1) {
-        //  items with MaxCount of 1 to avoid potential quest progression issues.
-        return 0; // Indicates this item should be skipped
+        return 0;
     } else if (item_db_max_count == 99) {
         return 66;
     } else if (item_db_max_count == 999) {
@@ -394,10 +427,8 @@ static int GetDesiredMaxCountForTier(int item_db_max_count) {
     } else if (item_db_max_count >= 9999) {
         return 6666;
     } else { 
-        // Default case: If MaxCount is not one of the explicit tiers (1, 99, 999, >=9999),
-        // it's safest to log a warning and skip the item to prevent unexpected behavior.
         LogMessage(LOG_WARNING_LEVEL, ("Unhandled MaxCount tier encountered: " + std::to_string(item_db_max_count) + ". Skipping item.").c_str());
-        return 0; // Skip this item as its MaxCount tier is not explicitly handled
+        return 0;
     }
 }
 
@@ -414,63 +445,56 @@ void SaveGameManager::MaxOwnIngredients(sqlite3* db) {
 
     nlohmann::json& ingredients_json_map = m_saveData["Ingredients"];
     int updated_count = 0;
-    int skipped_count = 0; // Counter for items skipped due to rules or issues
+    int skipped_count = 0;
 
-    // SQL to get MaxCount for an ingredient ID
-    sqlite3_stmt *stmt = nullptr; // Prepare statement once outside the loop
+    sqlite3_stmt *stmt = nullptr;
     std::string sql = "SELECT MaxCount FROM Items WHERE ItemDataID = ?;";
     int rc_prepare = sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, NULL);
     if (rc_prepare != SQLITE_OK) {
         LogMessage(LOG_ERROR_LEVEL, ("SQL prepare failed for MaxOwnIngredients: " + std::string(sqlite3_errmsg(db))).c_str());
-        return; // Exit if prepare fails
+        return;
     }
 
     for (auto it = ingredients_json_map.begin(); it != ingredients_json_map.end(); ++it) {
-        // Ensure "ingredientsID" exists and is an integer
         if (it.value().contains("ingredientsID") && it.value()["ingredientsID"].is_number_integer()) {
             int ingredients_id = it.value()["ingredientsID"].get<int>();
 
-            sqlite3_reset(stmt); // Reset statement for reuse in each iteration
+            sqlite3_reset(stmt);
             sqlite3_bind_int(stmt, 1, ingredients_id);
 
-            int max_count_from_db = 0; // Initialize to 0; will be retrieved from DB
+            int max_count_from_db = 0;
             if (sqlite3_step(stmt) == SQLITE_ROW) {
                 max_count_from_db = sqlite3_column_int(stmt, 0);
             } else {
                 LogMessage(LOG_WARNING_LEVEL, ("MaxCount not found for existing ingredient ID: " + std::to_string(ingredients_id) + " in Items table. Skipping update.").c_str());
-                skipped_count++; // Count as skipped due to DB lookup failure
-                continue; // Skip to next if item data not found
+                skipped_count++;
+                continue;
             }
 
-            // Determine the target count based on the item's MaxCount from DB
             int target_count = GetDesiredMaxCountForTier(max_count_from_db);
 
-            if (target_count > 0) { // target_count == 0 indicates skipping
-                // Update the count to the determined target
+            if (target_count > 0) {
                 it.value()["count"] = target_count;
                 updated_count++;
             } else {
-                // Item should be skipped (e.g., MaxCount == 1 or unhandled tier)
                 LogMessage(LOG_INFO_LEVEL, ("Skipping owned ingredient ID " + std::to_string(ingredients_id) + " with MaxCount " + std::to_string(max_count_from_db) + " as per tier rules.").c_str());
                 skipped_count++;
             }
         } else {
             LogMessage(LOG_WARNING_LEVEL, ("Skipping ingredient entry without valid 'ingredientsID': " + it.key() + ". Malformed entry.").c_str());
-            skipped_count++; // Count as skipped due to invalid JSON structure
+            skipped_count++;
         }
     }
 
-    sqlite3_finalize(stmt); // Clean up the prepared statement once after the loop
+    sqlite3_finalize(stmt);
     LogMessage(LOG_INFO_LEVEL, ("MaxOwnIngredients: Updated " + std::to_string(updated_count) + " owned ingredients. Skipped " + std::to_string(skipped_count) + " ingredients.").c_str());
 }
 
 // --- SQLite Callback for batch querying ingredients (for MaxAllIngredients) ---
-// This is a static function that can be accessed by sqlite3_exec
 static int callbackGetAllIngredients(void *data, int argc, char **argv, char **azColName){
     std::vector<std::map<std::string, int>>* results = static_cast<std::vector<std::map<std::string, int>>*>(data);
     std::map<std::string, int> row;
     for(int i = 0; i < argc; i++){
-        // Safely convert to int, assumes columns are numeric where relevant
         row[azColName[i]] = argv[i] ? std::stoi(argv[i]) : 0;
     }
     results->push_back(row);
@@ -498,7 +522,6 @@ void SaveGameManager::MaxAllIngredients(sqlite3* db) {
     std::string default_lastGainTime = "04/01/2025 12:34:56";
     std::string default_lastGainGameTime = "10/03/2022 08:30:52";
 
-    // If the ingredient map isn't empty, try to get a timestamp from the first entry.
     if (!ingredients_json_map.empty()) {
         auto& first_item_value = ingredients_json_map.begin().value();
         if (first_item_value.contains("lastGainTime") && first_item_value["lastGainTime"].is_string()) {
@@ -535,14 +558,13 @@ void SaveGameManager::MaxAllIngredients(sqlite3* db) {
 
     int updated_count = 0;
     int added_count = 0;
-    int skipped_count = 0; // Counter for items skipped due to rules or issues
+    int skipped_count = 0;
 
     for (const auto& db_ingredient : all_db_ingredients) {
-        // Ensure all required keys exist before accessing, to prevent exceptions
         if (!db_ingredient.count("ingredientsID_for_save_file_key") ||
             !db_ingredient.count("parentID") ||
             !db_ingredient.count("MaxCount")) {
-            LogMessage(LOG_WARNING_LEVEL, "Skipping database ingredient entry due to missing required fields (ingredientsID_for_save_file_key, parentID, or MaxCount).");
+            LogMessage(LOG_WARNING_LEVEL, "Skipping database ingredient entry due to missing required fields.");
             skipped_count++;
             continue;
         }
@@ -551,35 +573,30 @@ void SaveGameManager::MaxAllIngredients(sqlite3* db) {
         int parent_id_from_db = db_ingredient.at("parentID");
         int max_count_from_db = db_ingredient.at("MaxCount");
 
-        // Determine the target count based on the item's MaxCount from DB
         int target_count = GetDesiredMaxCountForTier(max_count_from_db);
 
         if (target_count == 0) {
-            // Item should be skipped (e.g., MaxCount == 1 or unhandled tier)
             LogMessage(LOG_INFO_LEVEL, ("Skipping ingredient ID " + std::to_string(ingredients_id_from_db) + " with MaxCount " + std::to_string(max_count_from_db) + " from database as per tier rules.").c_str());
             skipped_count++;
-            continue; // Skip to next if this item should not be maxed/added
+            continue;
         }
 
-        // The ingredient ID from the DB is used as the key in the JSON map
         std::string ingredient_key = std::to_string(ingredients_id_from_db);
 
         if (ingredients_json_map.contains(ingredient_key)) {
-            // Ingredient already exists, just update its count
             ingredients_json_map[ingredient_key]["count"] = target_count;
             updated_count++;
         } else {
-            // Ingredient does not exist, add it
             nlohmann::json new_ingredient_entry;
             new_ingredient_entry["ingredientsID"] = ingredients_id_from_db;
-            new_ingredient_entry["level"] = 1; // Default level
+            new_ingredient_entry["level"] = 1;
             new_ingredient_entry["parentID"] = parent_id_from_db;
-            new_ingredient_entry["count"] = target_count; // Set to the determined target count
-            new_ingredient_entry["branchCount"] = 0; // Default
+            new_ingredient_entry["count"] = target_count;
+            new_ingredient_entry["branchCount"] = 0;
             new_ingredient_entry["lastGainTime"] = default_lastGainTime;
             new_ingredient_entry["lastGainGameTime"] = default_lastGainGameTime;
-            new_ingredient_entry["isNew"] = true; // Mark as new
-            new_ingredient_entry["placeTagMask"] = 1; // Default
+            new_ingredient_entry["isNew"] = true;
+            new_ingredient_entry["placeTagMask"] = 1;
 
             ingredients_json_map[ingredient_key] = new_ingredient_entry;
             added_count++;
@@ -589,7 +606,6 @@ void SaveGameManager::MaxAllIngredients(sqlite3* db) {
 }
 
 // --- Static Helper: GetDefaultSaveGameDirectoryAndLatestFile Implementation ---
-// Discovers the default save game directory for Dave the Diver and identifies the most recent save file.
 std::filesystem::path SaveGameManager::GetDefaultSaveGameDirectoryAndLatestFile(std::string& latestSaveFileName) {
     PWSTR pszPath = NULL;
     std::filesystem::path baseSavePath;
@@ -608,7 +624,7 @@ std::filesystem::path SaveGameManager::GetDefaultSaveGameDirectoryAndLatestFile(
         const char* localAppDataEnv = getenv("LOCALAPPDATA");
         if (localAppDataEnv) {
             baseSavePath = localAppDataEnv;
-            baseSavePath = baseSavePath.parent_path() / "LocalLow"; // Correcting if LOCALAPPDATA gives ...\Roaming
+            baseSavePath = baseSavePath.parent_path() / "LocalLow";
             baseSavePath /= L"nexon";
             baseSavePath /= L"DAVE THE DIVER";
             baseSavePath /= L"SteamSData";
@@ -635,7 +651,6 @@ std::filesystem::path SaveGameManager::GetDefaultSaveGameDirectoryAndLatestFile(
 
     if (steamIDPath.empty()) {
         LogMessage(LOG_ERROR_LEVEL, (std::string("Could not find a SteamID folder under: ") + baseSavePath.string()).c_str());
-        // Fallback: If no SteamID folder found, assume the save files might be directly under baseSavePath
         steamIDPath = baseSavePath;
     }
 
@@ -647,7 +662,6 @@ std::filesystem::path SaveGameManager::GetDefaultSaveGameDirectoryAndLatestFile(
             if (entry.is_regular_file()) {
                 std::string fileName = entry.path().filename().string();
                 
-                // *** CHANGED: Updated logic to detect both auto and manual save files ***
                 bool is_autosave = (fileName.length() > 10 && fileName.substr(0, 8) == "GameSave" && fileName.substr(fileName.length() - 7) == "_GD.sav");
                 bool is_manual_save = (fileName.length() > 2 && fileName.substr(0, 2) == "m_" && fileName.substr(fileName.length() - 4) == ".sav");
 
@@ -677,3 +691,4 @@ std::filesystem::path SaveGameManager::GetDefaultSaveGameDirectoryAndLatestFile(
     return steamIDPath;
 }
 //END OF SaveGameManager.cpp
+
