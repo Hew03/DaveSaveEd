@@ -68,7 +68,7 @@ def xor_bytes_hybrid(data_bytes, key_bytes):
             # Apply the correct processing rules based on the bug pattern.
             if high_bit_count == 4:
                 # This is the "UTF-8 sequence" bug from brit.sav.
-                # Per user instruction, process 6 bytes and advance key by 6.
+                # Per user instruction, process 6 bytes and advance key by 4.
                 block_len_process = 6
                 key_advancement = 4
             else:
