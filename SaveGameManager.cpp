@@ -43,6 +43,7 @@
 #include "json.hpp"      // Corrected include for nlohmann/json
 #include <vector>        // Required for std::vector
 #include <map>           // Required for std::map
+#include <set>           // Required for std::set (for DLC check)
 #include <string>        // Required for std::string
 #include <stdexcept>     // Required for std::runtime_error
 #include <filesystem>    // Required for std::filesystem::path, create_directories, copy, last_write_time
@@ -501,7 +502,7 @@ static int callbackGetAllIngredients(void *data, int argc, char **argv, char **a
     return 0;
 }
 
-// --- MaxAllIngredients Implementation ---
+// --- MaxAllIngredients Implementation (Updated for DLC Awareness) ---
 void SaveGameManager::MaxAllIngredients(sqlite3* db) {
     if (!m_isSaveFileLoaded) {
         LogMessage(LOG_WARNING_LEVEL, "No save file loaded for MaxAllIngredients.");
@@ -511,6 +512,29 @@ void SaveGameManager::MaxAllIngredients(sqlite3* db) {
         LogMessage(LOG_ERROR_LEVEL, "Database handle (g_refDb) is null for MaxAllIngredients.");
         return;
     }
+
+    // --- DLC Check Setup ---
+    // 1. Define the mapping from DLCType in DB to DLC ID in save file
+    const std::map<int, int> dlcTypeToIdMap = {
+        {1, 14252001}, // Dredge
+        {3, 14252201}, // Godzilla
+        {5, 14252401}  // Ichiban
+    };
+
+    // 2. Get the set of installed DLC IDs from the save file
+    std::set<int> installedDlcIds;
+    if (m_saveData.contains("GameInfo") && m_saveData["GameInfo"].is_object() && m_saveData["GameInfo"].contains("installedDLCs") && m_saveData["GameInfo"]["installedDLCs"].is_array()) {
+        for (const auto& dlc_id : m_saveData["GameInfo"]["installedDLCs"]) {
+            if (dlc_id.is_number_integer()) {
+                installedDlcIds.insert(dlc_id.get<int>());
+            }
+        }
+        LogMessage(LOG_INFO_LEVEL, ("Found " + std::to_string(installedDlcIds.size()) + " installed DLCs in save file.").c_str());
+    } else {
+        LogMessage(LOG_WARNING_LEVEL, "Could not find 'installedDLCs' array in save file. Assuming no DLCs are owned.");
+    }
+    // --- End DLC Check Setup ---
+
 
     if (!m_saveData.contains("Ingredients") || !m_saveData["Ingredients"].is_object()) {
         LogMessage(LOG_INFO_LEVEL, "Creating empty 'Ingredients' section in save data.");
@@ -534,11 +558,13 @@ void SaveGameManager::MaxAllIngredients(sqlite3* db) {
     LogMessage(LOG_INFO_LEVEL, ("Using timestamps '" + default_lastGainTime + "' / '" + default_lastGainGameTime + "' for new ingredients.").c_str());
 
     std::vector<std::map<std::string, int>> all_db_ingredients;
+    // 3. Modify SQL query to fetch DLCType
     std::string sql_query = R"(
         SELECT
             I.TID AS ingredientsID_for_save_file_key,
             T.TID AS parentID,
-            T.MaxCount
+            T.MaxCount,
+            T.DLCType
         FROM
             Ingredients AS I
         JOIN
@@ -559,15 +585,35 @@ void SaveGameManager::MaxAllIngredients(sqlite3* db) {
     int updated_count = 0;
     int added_count = 0;
     int skipped_count = 0;
+    int skipped_dlc_count = 0; // New counter for unowned DLC items
 
+    // 4. Update processing loop with DLC check
     for (const auto& db_ingredient : all_db_ingredients) {
         if (!db_ingredient.count("ingredientsID_for_save_file_key") ||
             !db_ingredient.count("parentID") ||
-            !db_ingredient.count("MaxCount")) {
+            !db_ingredient.count("MaxCount") ||
+            !db_ingredient.count("DLCType")) { // Check for new field
             LogMessage(LOG_WARNING_LEVEL, "Skipping database ingredient entry due to missing required fields.");
             skipped_count++;
             continue;
         }
+
+        // --- DLC Ownership Check ---
+        int dlc_type_from_db = db_ingredient.at("DLCType");
+        auto it_dlc_map = dlcTypeToIdMap.find(dlc_type_from_db);
+
+        if (it_dlc_map != dlcTypeToIdMap.end()) {
+            // This item is part of a known DLC. Check if the user has it installed.
+            int required_dlc_id = it_dlc_map->second;
+            if (installedDlcIds.find(required_dlc_id) == installedDlcIds.end()) {
+                // User does not own this DLC, so skip the item.
+                LogMessage(LOG_INFO_LEVEL, ("Skipping ingredient ID " + std::to_string(db_ingredient.at("ingredientsID_for_save_file_key")) + " from unowned DLC Type " + std::to_string(dlc_type_from_db)).c_str());
+                skipped_dlc_count++;
+                continue;
+            }
+        }
+        // If we reach here, it's either a base game item (not in map) or a DLC item the user owns.
+        // --- End DLC Ownership Check ---
 
         int ingredients_id_from_db = db_ingredient.at("ingredientsID_for_save_file_key");
         int parent_id_from_db = db_ingredient.at("parentID");
@@ -602,7 +648,15 @@ void SaveGameManager::MaxAllIngredients(sqlite3* db) {
             added_count++;
         }
     }
-    LogMessage(LOG_INFO_LEVEL, ("MaxAllIngredients: Updated " + std::to_string(updated_count) + " existing, added " + std::to_string(added_count) + " new, skipped " + std::to_string(skipped_count) + " ingredients.").c_str());
+    
+    // 5. Update final log message
+    std::stringstream log_summary;
+    log_summary << "MaxAllIngredients: Updated " << updated_count
+                << " existing, added " << added_count
+                << " new, skipped " << skipped_count
+                << " (malformed/rules), skipped " << skipped_dlc_count
+                << " (unowned DLC) ingredients.";
+    LogMessage(LOG_INFO_LEVEL, log_summary.str().c_str());
 }
 
 // --- Static Helper: GetDefaultSaveGameDirectoryAndLatestFile Implementation ---
@@ -691,4 +745,3 @@ std::filesystem::path SaveGameManager::GetDefaultSaveGameDirectoryAndLatestFile(
     return steamIDPath;
 }
 //END OF SaveGameManager.cpp
-
