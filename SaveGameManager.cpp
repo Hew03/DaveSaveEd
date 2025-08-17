@@ -78,8 +78,8 @@ std::vector<unsigned char> SaveGameManager::XORHybrid(const std::vector<unsigned
 
         if (decrypted_peek >= 128) {
             // --- Special Block Case ---
-            // Check the next 4 bytes to determine the bug pattern
-            size_t block_len_check = 4;
+            // Check the next 9 bytes to determine the bug pattern
+            size_t block_len_check = 9;
             size_t block_end_check = std::min(data_idx + block_len_check, data.size());
             
             int high_bit_count = 0;
@@ -95,7 +95,11 @@ std::vector<unsigned char> SaveGameManager::XORHybrid(const std::vector<unsigned
             size_t block_len_process;
             size_t key_advancement;
 
-            if (high_bit_count == 4) {
+            if (high_bit_count == 9) {
+                // This is the "UTF-8 sequence" bug from hack.sav.
+                block_len_process = 9;
+                key_advancement = 3;
+            } else if (high_bit_count == 4) {
                 // This is the "UTF-8 sequence" bug. Process 6 data bytes, advance key by 4.
                 block_len_process = 6;
                 key_advancement = 4;
@@ -105,12 +109,12 @@ std::vector<unsigned char> SaveGameManager::XORHybrid(const std::vector<unsigned
                 key_advancement = 3;
             }
 
-            LogMessage(LOG_INFO_LEVEL, ("High-bit block detected (" + std::to_string(high_bit_count) + "/4). Processing " + std::to_string(block_len_process) + " bytes, advancing key by " + std::to_string(key_advancement) + ".").c_str());
+            LogMessage(LOG_INFO_LEVEL, ("High-bit block detected (" + std::to_string(high_bit_count) + "/" + std::to_string(block_len_check) + "). Processing " + std::to_string(block_len_process) + " bytes, advancing key by " + std::to_string(key_advancement) + ".").c_str());
             
             // Process the determined number of bytes
             size_t block_end_process = std::min(data_idx + block_len_process, data.size());
             for (size_t i = 0; i < (block_end_process - data_idx); ++i) {
-                unsigned char current_key_byte = key[(key_idx + i) % key_len];
+                unsigned char current_key_byte = key[(key_idx + key_advancement + i) % key_len];
                 output.push_back(data[data_idx + i] ^ current_key_byte);
             }
 
@@ -427,7 +431,7 @@ static int GetDesiredMaxCountForTier(int item_db_max_count) {
         return 666;
     } else if (item_db_max_count >= 9999) {
         return 6666;
-    } else { 
+    } else {
         LogMessage(LOG_WARNING_LEVEL, ("Unhandled MaxCount tier encountered: " + std::to_string(item_db_max_count) + ". Skipping item.").c_str());
         return 0;
     }
