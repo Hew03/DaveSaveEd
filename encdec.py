@@ -17,249 +17,260 @@
 #    in a product, an acknowledgment in the product documentation would be
 #    appreciated but is not required.
 # 2. Altered source versions must be plainly marked as such, and must not be
-#    misrepresented as being the original software.
+#    misrepresented as being the original software#
 # 3. This notice may not be removed or altered from any source distribution.
 
 import sys
 import os
 import json
-import binascii
+import re
 import filecmp
 
-# The XOR key used for encryption and decryption.
-# It's defined as a bytes literal for direct use in XOR operations.
 XOR_KEY = b"GameData"
+TROUBLESOME_TRIGGERS = [
+    b'"FarmAnimal":[{"FarmAnimalID":11090001,"Name":"',
+]
+BYPASS_PREFIX = "BYPASSED_HEX::"
 
-def xor_bytes_hybrid(data_bytes, key_bytes):
-    """
-    Performs a repeating-key XOR using a hybrid algorithm that can handle
-    multiple distinct bugs found in the game's save files.
-
-    It detects a high-bit character, then inspects the following bytes to
-    determine which bug has been encountered, and applies the correct
-    key synchronization fix for that specific case.
-    """
+def xor_bytes(data_bytes, key_bytes, key_start_index=0):
+    """Performs a repeating-key XOR on a byte sequence."""
     key_len = len(key_bytes)
-    output_bytes = bytearray()
+    return bytes([byte ^ key_bytes[(key_start_index + i) % key_len] for i, byte in enumerate(data_bytes)])
+
+def find_field_details(encrypted_bytes, start_pos):
+    """
+    Uses a two-pass check to find the length of a problematic field and the
+    correct re-sync key index for the data that follows.
+    """
+    print("\n--- ENTERING find_field_details ---")
+    print(f"[DEBUG] Starting analysis from byte position: {start_pos}")
+
+    field_len = None
     
-    data_idx = 0
-    key_idx = 0
+    # --- Pass 1: Find the length of the problematic field ---
+    print("\n[DEBUG] Pass 1: Searching for the end-of-field marker '\"}],'... ")
+    slice_for_len_check = encrypted_bytes[start_pos:]
+    for offset_pass1 in range(len(XOR_KEY)):
+        temp_key_idx = (start_pos + offset_pass1) % len(XOR_KEY)
+        decrypted_slice = xor_bytes(slice_for_len_check, XOR_KEY, key_start_index=temp_key_idx)
+        print(f"[DEBUG]   Offset {offset_pass1} | Preview: {decrypted_slice[:120]!r}")
+        try:
+            end_marker_pos = decrypted_slice.index(b'"}],')
+            field_len = end_marker_pos
+            print(f"[DEBUG]   SUCCESS (Pass 1): Found marker with offset {offset_pass1}. Field length: {field_len}")
+            break
+        except ValueError:
+            continue
+    if field_len is None:
+        print("[DEBUG] Pass 1 FAILED: Could not find end marker with any offset.")
+        print("--- EXITING find_field_details (Failure) ---\n")
+        return None, None
 
-    while data_idx < len(data_bytes):
-        # Peek ahead by decrypting the current byte to check its value.
-        peek_key_byte = key_bytes[key_idx % key_len]
-        decrypted_peek = data_bytes[data_idx] ^ peek_key_byte
-
-        # Check if the decrypted byte would have the high bit set.
-        if decrypted_peek >= 128:
-            # --- Special Block Case ---
-            # A high-bit character was detected. Now we need to determine
-            # which bug we've encountered by counting consecutive high-bit bytes.
-            block_len_check = 4
-            block_end_check = min(data_idx + block_len_check, len(data_bytes))
+    # --- Pass 2: Find the correct re-sync key offset for the rest of the file ---
+    resync_pos = start_pos + field_len
+    print(f"\n[DEBUG] Pass 2: Searching for a valid key offset at re-sync position {resync_pos}...")
+    slice_for_offset_check = encrypted_bytes[resync_pos : resync_pos + 50]
+    final_resync_key_idx = None
+    for offset_pass2 in range(len(XOR_KEY)):
+        temp_key_idx = (resync_pos + offset_pass2) % len(XOR_KEY)
+        decrypted_slice = xor_bytes(slice_for_offset_check, XOR_KEY, key_start_index=temp_key_idx)
+        print(f"[DEBUG]   Offset {offset_pass2} | Preview: {decrypted_slice!r}")
+        if decrypted_slice.startswith(b'"}],'):
+            final_resync_key_idx = temp_key_idx
+            print(f"[DEBUG]   SUCCESS (Pass 2): Found valid re-sync key index: {final_resync_key_idx}")
+            print("--- EXITING find_field_details (Success) ---\n")
+            return field_len, final_resync_key_idx
             
-            high_bit_count = 0
-            for i in range(block_end_check - data_idx):
-                check_key_byte = key_bytes[(key_idx + i) % key_len]
-                decrypted_check = data_bytes[data_idx + i] ^ check_key_byte
-                if decrypted_check >= 128:
-                    high_bit_count += 1
-
-            # Apply the correct processing rules based on the bug pattern.
-            if high_bit_count == 4:
-                # This is the "UTF-8 sequence" bug from brit.sav.
-                # Per user instruction, process 6 bytes and advance key by 4.
-                block_len_process = 6
-                key_advancement = 4
-            else:
-                # Default to the "legacy codepage" bug fix from orig.sav.
-                # Process 4 data bytes, advance key by 3 (slip of 1).
-                block_len_process = 4
-                key_advancement = 3
-
-            # Process the determined block length by XORing each byte.
-            block_end_process = min(data_idx + block_len_process, len(data_bytes))
-            for i in range(block_end_process - data_idx):
-                current_key_byte = key_bytes[(key_idx + i) % key_len]
-                output_bytes.append(data_bytes[data_idx + i] ^ current_key_byte)
-            
-            # Advance the data pointer by the number of bytes we processed.
-            data_idx += (block_end_process - data_idx)
-            # Advance the key index by the amount we determined was correct for this bug.
-            key_idx += key_advancement
-        else:
-            # --- Standard XOR Case ---
-            # The decrypted byte is standard ASCII, so we append it.
-            output_bytes.append(decrypted_peek)
-            data_idx += 1
-            key_idx += 1
-            
-    return bytes(output_bytes)
-
-
-def encode_json_to_sav(json_filepath, is_test=False):
-    """
-    Reads a JSON file, strips whitespace, XORs it with the hybrid algorithm,
-    and saves the result as a raw binary .sav file.
-    """
-    try:
-        # 1. Read the JSON file using a permissive encoding.
-        with open(json_filepath, 'r', encoding='latin-1') as f:
-            # For the test, the file is already compact. For normal use, parse and dump.
-            if is_test:
-                compact_json_string = f.read()
-            else:
-                json_data = json.load(f)
-                compact_json_string = json.dumps(json_data, separators=(',', ':'))
-        
-        # 3. Encode the compact JSON string to bytes using the same encoding.
-        json_bytes = compact_json_string.encode('latin-1')
-        
-        # 4. Perform the XOR hash operation using the new hybrid logic.
-        hashed_bytes = xor_bytes_hybrid(json_bytes, XOR_KEY)
-        
-        # 5. Determine the output filename.
-        base_name = os.path.splitext(json_filepath)[0]
-        output_filepath = base_name + ".resave" if is_test else base_name + ".sav"
-        
-        # 6. Prompt for overwrite if not in test mode.
-        if not is_test and os.path.exists(output_filepath):
-            response = input(f"'{output_filepath}' already exists. Overwrite? (y/N): ").lower()
-            if response != 'y':
-                print(f"Skipping encoding for '{json_filepath}'.")
-                return
-
-        # 7. Write the raw binary hashed data to the output file.
-        with open(output_filepath, 'wb') as f:
-            f.write(hashed_bytes)
-        
-        if not is_test:
-            print(f"Successfully encoded '{json_filepath}' to '{output_filepath}'.")
-
-    except FileNotFoundError:
-        print(f"Error: Input file not found at '{json_filepath}'.", file=sys.stderr)
-    except json.JSONDecodeError:
-        print(f"Error: Invalid JSON format in '{json_filepath}'. Please ensure it's valid JSON.", file=sys.stderr)
-    except Exception as e:
-        print(f"An unexpected error occurred during encoding '{json_filepath}': {e}", file=sys.stderr)
+    print("[DEBUG] Pass 2 FAILED: Could not find a valid re-sync offset.")
+    print("--- EXITING find_field_details (Failure) ---\n")
+    return field_len, None
 
 def decode_sav_to_json(sav_filepath, pretty_print=True):
     """
-    Reads a .sav file, decodes it, and saves the result as a .json file.
+    Reads and decodes a .sav file, proactively finding and bypassing problematic fields.
     """
+    print(f"[INFO] Decoding '{sav_filepath}'...")
     try:
-        # 1. Read the .sav file as raw binary data.
         with open(sav_filepath, 'rb') as f:
-            hashed_bytes = f.read()
-        
-        # 2. Perform the XOR decode operation using the new hybrid logic.
-        decoded_bytes = xor_bytes_hybrid(hashed_bytes, XOR_KEY)
-        
-        # 3. Decode the bytes back to a string using a permissive encoding.
-        decoded_json_string = decoded_bytes.decode('latin-1')
-        
-        # 4. Determine the output filename.
-        base_name = os.path.splitext(sav_filepath)[0]
-        output_filepath = base_name + ".json"
-        
-        # 5. Prompt for overwrite if not pretty-printing for a test.
-        if pretty_print and os.path.exists(output_filepath):
-            response = input(f"'{output_filepath}' already exists. Overwrite? (y/N): ").lower()
-            if response != 'y':
-                print(f"Skipping decoding for '{sav_filepath}'.")
-                return
+            encrypted_bytes = f.read()
 
-        # 6. Save the output, pretty-printing if requested.
+        output_buffer = bytearray()
+        data_idx = 0
+        key_idx = 0
+
+        while data_idx < len(encrypted_bytes):
+            decrypted_byte = encrypted_bytes[data_idx] ^ XOR_KEY[key_idx % len(XOR_KEY)]
+            output_buffer.append(decrypted_byte)
+
+            trigger_found = False
+            for trigger in TROUBLESOME_TRIGGERS:
+                if output_buffer.endswith(trigger):
+                    field_start_pos = data_idx + 1
+                    length, new_key_idx = find_field_details(encrypted_bytes, field_start_pos)
+                    
+                    if length is not None and new_key_idx is not None:
+                        field_bytes = encrypted_bytes[field_start_pos : field_start_pos + length]
+                        
+                        output_buffer = output_buffer[:-len(trigger)]
+                        output_buffer.extend(trigger)
+                        bypass_string = f'{BYPASS_PREFIX}{field_bytes.hex()}:{new_key_idx}'
+                        output_buffer.extend(bypass_string.encode('ascii'))
+                        
+                        data_idx = field_start_pos + length
+                        key_idx = new_key_idx
+                        trigger_found = True
+                    else:
+                        print(f"[WARNING] Trigger found at byte {data_idx}, but could not determine field details. Aborting.", file=sys.stderr)
+                        return
+            
+            if not trigger_found:
+                data_idx += 1
+                key_idx += 1
+        
+        try:
+            final_json_string = output_buffer.decode('utf-8')
+            parsed_json = json.loads(final_json_string)
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            print(f"\n[ERROR] Final repaired data could not be parsed as valid JSON.", file=sys.stderr)
+            print(f"  - Reason: {e}", file=sys.stderr)
+            error_filepath = os.path.splitext(sav_filepath)[0] + ".failed_decode.bin"
+            print(f"  - Saving the raw decrypted data to '{error_filepath}' for inspection.")
+            with open(error_filepath, 'wb') as f:
+                f.write(output_buffer)
+            return
+
+        output_filepath = os.path.splitext(sav_filepath)[0] + ".json"
+        
+        with open(output_filepath, 'w', encoding='utf-8') as f:
+            if pretty_print:
+                json.dump(parsed_json, f, indent=4, ensure_ascii=False)
+            else:
+                json.dump(parsed_json, f, separators=(',', ':'), ensure_ascii=False)
+        
         if pretty_print:
-            try:
-                parsed_json = json.loads(decoded_json_string)
-                with open(output_filepath, 'w', encoding='latin-1') as f:
-                    json.dump(parsed_json, f, indent=4, ensure_ascii=False)
-                print(f"Successfully decoded '{sav_filepath}' to '{output_filepath}' (pretty-printed).")
-            except json.JSONDecodeError:
-                print(f"Warning: Decoded data from '{sav_filepath}' is not valid JSON. Saving as raw text.", file=sys.stderr)
-                with open(output_filepath, 'w', encoding='latin-1') as f:
-                    f.write(decoded_json_string)
-                print(f"Successfully decoded '{sav_filepath}' to '{output_filepath}' (raw text).")
-        else:
-            # Save the raw, non-pretty-printed JSON for the test.
-            with open(output_filepath, 'w', encoding='latin-1') as f:
-                f.write(decoded_json_string)
+            print(f"Successfully decoded and saved to '{output_filepath}'.")
 
-    except FileNotFoundError:
-        print(f"Error: Input file not found at '{sav_filepath}'.", file=sys.stderr)
     except Exception as e:
-        print(f"An unexpected error occurred during decoding '{sav_filepath}': {e}", file=sys.stderr)
+        print(f"An unexpected error occurred during decode: {e}", file=sys.stderr)
 
-def test_reversibility(sav_filepath):
+def encode_json_to_sav(json_filepath, is_test=False):
     """
-    Performs a round-trip test (sav -> json -> resave) and compares the result.
+    Reads a JSON file, re-encoding it and splicing back in any bypassed fields.
     """
-    print(f"--- Running reversibility test on '{sav_filepath}' ---")
+    if not is_test: print(f"[INFO] Encoding '{json_filepath}'...")
+    try:
+        with open(json_filepath, 'r', encoding='utf-8') as f:
+            text_data = f.read()
+
+        if is_test:
+            compact_json_string = text_data
+        else:
+            compact_json_string = json.dumps(json.loads(text_data), separators=(',', ':'), ensure_ascii=False)
+
+        pattern = re.compile(rf'{BYPASS_PREFIX}([a-fA-F0-9]+):(\d+)')
+        output_bytes = bytearray()
+        last_end = 0
+        key_idx = 0
+
+        for match in pattern.finditer(compact_json_string):
+            start, end = match.span()
+            
+            clean_part_str = compact_json_string[last_end:start]
+            clean_part_bytes = clean_part_str.encode('utf-8')
+            output_bytes.extend(xor_bytes(clean_part_bytes, XOR_KEY, key_start_index=key_idx))
+            key_idx = (key_idx + len(clean_part_bytes)) % len(XOR_KEY)
+            
+            hex_data = match.group(1)
+            new_key_idx = int(match.group(2))
+            
+            raw_field_bytes = bytes.fromhex(hex_data)
+            output_bytes.extend(raw_field_bytes)
+            key_idx = new_key_idx
+            
+            last_end = end
+
+        remaining_part_str = compact_json_string[last_end:]
+        remaining_part_bytes = remaining_part_str.encode('utf-8')
+        output_bytes.extend(xor_bytes(remaining_part_bytes, XOR_KEY, key_start_index=key_idx))
+
+        base_name = os.path.splitext(json_filepath)[0]
+        output_filepath = base_name + ".resave" if is_test else base_name + ".sav"
+        
+        if not is_test and os.path.exists(output_filepath):
+             response = input(f"'{output_filepath}' already exists. Overwrite? (y/N): ").lower()
+             if response != 'y': return
+
+        with open(output_filepath, 'wb') as f:
+            f.write(output_bytes)
+        
+        if not is_test:
+            print(f"Successfully encoded to '{output_filepath}'.")
+
+    except Exception as e:
+        print(f"An unexpected error occurred during encode: {e}", file=sys.stderr)
+
+def test_roundtrip(sav_filepath):
+    """
+    Performs a decode/encode cycle and compares the result to the original file.
+    """
+    print(f"--- Running round-trip test on '{sav_filepath}' ---")
     base_name = os.path.splitext(sav_filepath)[0]
     json_filepath = base_name + ".json"
     resave_filepath = base_name + ".resave"
+    are_identical = False
 
-    # 1. Decode sav to raw json (no pretty-printing)
-    print("Step 1: Decoding .sav to raw .json...")
-    decode_sav_to_json(sav_filepath, pretty_print=False)
+    try:
+        print("\nStep 1: Decoding .sav to raw .json...")
+        decode_sav_to_json(sav_filepath, pretty_print=False)
 
-    # 2. Re-encode raw json to .resave
-    print("Step 2: Re-encoding raw .json to .resave...")
-    encode_json_to_sav(json_filepath, is_test=True)
+        if not os.path.exists(json_filepath):
+            print("\nFAILURE: Decode step failed to produce a .json file.")
+            return
 
-    # 3. Compare original .sav with .resave
-    print("Step 3: Comparing original .sav with the new .resave file...")
-    are_identical = filecmp.cmp(sav_filepath, resave_filepath, shallow=False)
+        print("\nStep 2: Re-encoding raw .json to .resave...")
+        encode_json_to_sav(json_filepath, is_test=True)
 
-    if are_identical:
-        print("\nSUCCESS: The files are identical. The algorithm is reversible.")
-    else:
-        print("\nFAILURE: The files are NOT identical. The algorithm is not perfectly reversible.")
+        print("\nStep 3: Comparing original .sav with the new .resave file...")
+        are_identical = filecmp.cmp(sav_filepath, resave_filepath, shallow=False)
 
-    # 4. Clean up intermediate files
-    print(f"Cleaning up temporary file (.resave)... The decoded file '{json_filepath}' has been kept for inspection.")
-    # os.remove(json_filepath) # Keep the json file as requested
-    os.remove(resave_filepath)
-    print("--- Test complete ---")
+        if are_identical:
+            print("\nSUCCESS: The files are identical. The process is perfectly reversible.")
+        else:
+            print("\nFAILURE: The files are NOT identical. The process is not reversible.")
 
+    finally:
+        if are_identical:
+            print("\nStep 4: Cleaning up intermediate files...")
+            if os.path.exists(json_filepath): os.remove(json_filepath)
+            if os.path.exists(resave_filepath): os.remove(resave_filepath)
+        print("--- Test complete ---")
 
 def display_usage():
-    """
-    Displays the script's usage message.
-    """
+    """Displays the script's usage message."""
     script_name = os.path.basename(sys.argv[0])
     print(f"Usage: {script_name} <file1.json | file1.sav> [file2 ...]")
     print(f"   or: {script_name} --test <file.sav>")
-    print("\nThis script encodes/decodes Dave the Diver save files.")
-    print("The --test flag performs a round-trip conversion to check for perfect reversibility.")
+    print("\nconvert save files for dave the Diver between .sav and .json")
 
 def main():
-    """
-    Main function to parse command-line arguments and call appropriate functions.
-    """
+    """Main function to parse command-line arguments."""
     if len(sys.argv) < 2:
         display_usage()
         sys.exit(1)
 
-    # Check for test mode
     if sys.argv[1] == '--test':
         if len(sys.argv) != 3 or not sys.argv[2].lower().endswith('.sav'):
             print("\nError: --test flag requires a single .sav file as an argument.", file=sys.stderr)
             display_usage()
             sys.exit(1)
-        test_reversibility(sys.argv[2])
+        test_roundtrip(sys.argv[2])
         return
 
-    # Normal encode/decode mode
     for filepath in sys.argv[1:]:
         if not os.path.exists(filepath):
             print(f"Warning: File not found: '{filepath}'. Skipping.", file=sys.stderr)
             continue
-
-        filename, ext = os.path.splitext(filepath)
-        ext = ext.lower()
-
+        ext = os.path.splitext(filepath)[1].lower()
         if ext == '.json':
             encode_json_to_sav(filepath)
         elif ext == '.sav':
@@ -267,9 +278,7 @@ def main():
         else:
             print(f"Warning: Unsupported file extension '{ext}' for '{filepath}'. Skipping.", file=sys.stderr)
 
-# Entry point of the script.
 if __name__ == "__main__":
     main()
 
 # END OF encdec.py
-
