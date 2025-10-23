@@ -35,9 +35,9 @@
 #include <fstream>       // For file input/output streams
 #include <shlobj.h>      // For SHGetKnownFolderPath (includes windows.h)
 #include <chrono>        // For timestamping (std::chrono)
-#include <iomanip>       // For std::put_time
+#include <iomanip>       // For std::put_time, std::hex, std::setw, std::setfill
 #include <sstream>       // For std::stringstream
-#include <algorithm>     // For std::all_of, and std::min/max
+#include <algorithm>     // For std::all_of, std::min/max, std::search, std::equal
 #include "sqlite3.h"     // Required for sqlite3* parameter in MaxAllIngredients
 #include "Logger.h"      // For LogMessage
 #include "json.hpp"      // Corrected include for nlohmann/json
@@ -47,11 +47,27 @@
 #include <string>        // Required for std::string
 #include <stdexcept>     // Required for std::runtime_error
 #include <filesystem>    // Required for std::filesystem::path, create_directories, copy, last_write_time
+#include <regex>         // For regex matching in EncodeWithBypass
 
 // --- Global Constants for SaveGameManager ---
-// Note: XOR_KEY is defined in SaveGameManager.h
+// Note: XOR_KEY is defined in SaveGameManager.h as a member const
 // Use long long for currency to avoid overflow
 const long long SAVE_MAX_CURRENCY = 999999999LL;
+
+// --- Constants for Bypass Logic ---
+static const std::string BYPASS_PREFIX = "BYPASSED_HEX::";
+static const std::vector<unsigned char> TRIGGER_FARMANIMAL = {
+    '"', 'F', 'a', 'r', 'm', 'A', 'n', 'i', 'm', 'a', 'l', '"', ':',
+    '[', '{', '"', 'F', 'a', 'r', 'm', 'A', 'n', 'i', 'm', 'a', 'l',
+    'I', 'D', '"', ':', '1', '1', '0', '9', '0', '0', '0', '1', ',',
+    '"', 'N', 'a', 'm', 'e', '"', ':', '"'
+};
+// This can be a vector of vectors if more triggers are found
+static const std::vector<std::vector<unsigned char>> TROUBLESOME_TRIGGERS = {
+    TRIGGER_FARMANIMAL
+};
+static const std::vector<unsigned char> END_MARKER = { '"', '}', ']', ',' };
+
 
 // Constructor: Initializes the SaveGameManager instance.
 SaveGameManager::SaveGameManager() : m_isSaveFileLoaded(false) {
@@ -63,115 +79,266 @@ SaveGameManager::~SaveGameManager() {
     LogMessage(LOG_INFO_LEVEL, "SaveGameManager shutting down.");
 }
 
-// --- HYBRID XOR FUNCTION (Updated with Triage Logic and vector<unsigned char>) ---
-std::vector<unsigned char> SaveGameManager::XORHybrid(const std::vector<unsigned char>& data, const std::string& key) {
-    std::vector<unsigned char> output;
-    output.reserve(data.size());
+// --- Hex/Byte Helpers ---
 
-    size_t data_idx = 0;
-    size_t key_idx = 0;
-    size_t key_len = key.length();
+// Helper for EncodeWithBypass: Converts byte vector to hex string.
+std::string SaveGameManager::BytesToHex(const std::vector<unsigned char>& bytes) {
+    std::stringstream ss;
+    ss << std::hex << std::setfill('0');
+    for (unsigned char byte : bytes) {
+        ss << std::setw(2) << static_cast<int>(byte);
+    }
+    return ss.str();
+}
 
-    while (data_idx < data.size()) {
-        unsigned char peek_key_byte = key[key_idx % key_len];
-        unsigned char decrypted_peek = data[data_idx] ^ peek_key_byte;
-
-        if (decrypted_peek >= 128) {
-            // --- Special Block Case ---
-            // Check the next 9 bytes to determine the bug pattern
-            size_t block_len_check = 9;
-            size_t block_end_check = std::min(data_idx + block_len_check, data.size());
-            
-            int high_bit_count = 0;
-            for (size_t i = 0; i < (block_end_check - data_idx); ++i) {
-                unsigned char check_key_byte = key[(key_idx + i) % key_len];
-                unsigned char decrypted_check = data[data_idx + i] ^ check_key_byte;
-                if (decrypted_check >= 128) {
-                    ++high_bit_count;
-                }
-            }
-
-            // Determine the correct data block length and key advancement based on the pattern
-            size_t block_len_process;
-            size_t key_advancement;
-
-            if (high_bit_count == 9) {
-                // This is the "UTF-8 sequence" bug from hack.sav.
-                block_len_process = 9;
-                key_advancement = 3;
-            } else if (high_bit_count == 4) {
-                // This is the "UTF-8 sequence" bug. Process 6 data bytes, advance key by 4.
-                block_len_process = 6;
-                key_advancement = 4;
-            } else {
-                // This is the "legacy codepage" bug. Process 4 data bytes, advance key by 3.
-                block_len_process = 4;
-                key_advancement = 3;
-            }
-
-            LogMessage(LOG_INFO_LEVEL, ("High-bit block detected (" + std::to_string(high_bit_count) + "/" + std::to_string(block_len_check) + "). Processing " + std::to_string(block_len_process) + " bytes, advancing key by " + std::to_string(key_advancement) + ".").c_str());
-            
-            // Process the determined number of bytes
-            size_t block_end_process = std::min(data_idx + block_len_process, data.size());
-            for (size_t i = 0; i < (block_end_process - data_idx); ++i) {
-                unsigned char current_key_byte = key[(key_idx + key_advancement + i) % key_len];
-                output.push_back(data[data_idx + i] ^ current_key_byte);
-            }
-
-            data_idx += (block_end_process - data_idx);
-            key_idx += key_advancement;
-
-        } else {
-            // --- Standard XOR Case ---
-            output.push_back(decrypted_peek);
-            data_idx += 1;
-            key_idx += 1;
+// Helper for EncodeWithBypass: Converts hex string to byte vector.
+std::vector<unsigned char> SaveGameManager::HexToBytes(const std::string& hex) {
+    std::vector<unsigned char> bytes;
+    if (hex.length() % 2 != 0) {
+        LogMessage(LOG_WARNING_LEVEL, "HexToBytes: Input string has odd length. Returning empty vector.");
+        return bytes;
+    }
+    bytes.reserve(hex.length() / 2);
+    for (size_t i = 0; i < hex.length(); i += 2) {
+        try {
+            std::string byteString = hex.substr(i, 2);
+            unsigned char byte = static_cast<unsigned char>(std::stoul(byteString, nullptr, 16));
+            bytes.push_back(byte);
+        } catch (const std::exception& e) {
+            LogMessage(LOG_ERROR_LEVEL, (std::string("HexToBytes: Error parsing hex string: ") + e.what()).c_str());
+            bytes.clear();
+            return bytes;
         }
+    }
+    return bytes;
+}
+
+
+// --- BYPASS-AND-RESYNC XOR FUNCTIONS (NEW) ---
+
+// Helper for FindFieldDetails: Simple repeating-key XOR on a vector slice.
+std::vector<unsigned char> SaveGameManager::XorBytes(const std::vector<unsigned char>& data_bytes, size_t key_start_index) {
+    std::vector<unsigned char> output;
+    output.reserve(data_bytes.size());
+    size_t key_len = XOR_KEY.length();
+    if (key_len == 0) return data_bytes; // Avoid divide by zero
+
+    for (size_t i = 0; i < data_bytes.size(); ++i) {
+        output.push_back(data_bytes[i] ^ XOR_KEY[(key_start_index + i) % key_len]);
     }
     return output;
 }
 
-// --- ENCODING HELPERS ---
-std::string SaveGameManager::Latin1ToUTF8(const std::vector<unsigned char>& latin1_bytes) {
-    std::string utf8_str;
-    utf8_str.reserve(latin1_bytes.size());
+// Helper for DecodeAndBypass: Finds problematic field length and next key index.
+bool SaveGameManager::FindFieldDetails(const std::vector<unsigned char>& encrypted_bytes, size_t start_pos,
+                                  size_t& out_field_len, size_t& out_resync_key_idx)
+{
+    LogMessage(LOG_INFO_LEVEL, ("--- ENTERING FindFieldDetails: Starting analysis from byte " + std::to_string(start_pos)).c_str());
+    size_t key_len = XOR_KEY.length();
+    bool length_found = false;
+    out_field_len = 0;
 
-    for (unsigned char c : latin1_bytes) {
-        if (c < 0x80) {
-            utf8_str += c;
-        } else {
-            utf8_str += (0xC0 | (c >> 6));
-            utf8_str += (0x80 | (c & 0x3F));
+    if (start_pos >= encrypted_bytes.size()) {
+        LogMessage(LOG_WARNING_LEVEL, "[DEBUG] FindFieldDetails FAILED: start_pos is at or beyond end of data.");
+        return false;
+    }
+
+    // --- Pass 1: Find the length of the problematic field ---
+    LogMessage(LOG_INFO_LEVEL, "[DEBUG] Pass 1: Searching for end-of-field marker...");
+    std::vector<unsigned char> slice_for_len_check(encrypted_bytes.begin() + start_pos, encrypted_bytes.end());
+
+    for (size_t offset_pass1 = 0; offset_pass1 < key_len; ++offset_pass1) {
+        size_t temp_key_idx = (start_pos + offset_pass1) % key_len;
+        std::vector<unsigned char> decrypted_slice = XorBytes(slice_for_len_check, temp_key_idx);
+
+        // Search for END_MARKER in decrypted_slice
+        auto it = std::search(decrypted_slice.begin(), decrypted_slice.end(), END_MARKER.begin(), END_MARKER.end());
+
+        if (it != decrypted_slice.end()) {
+            out_field_len = std::distance(decrypted_slice.begin(), it);
+            length_found = true;
+            LogMessage(LOG_INFO_LEVEL, ("[DEBUG]   SUCCESS (Pass 1): Found marker with offset " + std::to_string(offset_pass1) + ". Field length: " + std::to_string(out_field_len)).c_str());
+            break;
         }
     }
-    return utf8_str;
+
+    if (!length_found) {
+        LogMessage(LOG_WARNING_LEVEL, "[DEBUG] Pass 1 FAILED: Could not find end marker.");
+        return false;
+    }
+
+    // --- Pass 2: Find the correct re-sync key offset ---
+    size_t resync_pos = start_pos + out_field_len;
+    LogMessage(LOG_INFO_LEVEL, ("[DEBUG] Pass 2: Searching for valid key offset at re-sync position " + std::to_string(resync_pos)).c_str());
+
+    if (resync_pos >= encrypted_bytes.size()) {
+         LogMessage(LOG_WARNING_LEVEL, "[DEBUG] Pass 2 FAILED: Re-sync position is at or beyond end of data.");
+         return false;
+    }
+
+    size_t slice_len = std::min(static_cast<size_t>(50), encrypted_bytes.size() - resync_pos);
+    if (slice_len < END_MARKER.size()) { // Need at least enough data to check for the marker
+         LogMessage(LOG_WARNING_LEVEL, "[DEBUG] Pass 2 FAILED: Not enough data for re-sync check.");
+         return false;
+    }
+    std::vector<unsigned char> slice_for_offset_check(encrypted_bytes.begin() + resync_pos, encrypted_bytes.begin() + resync_pos + slice_len);
+
+    for (size_t offset_pass2 = 0; offset_pass2 < key_len; ++offset_pass2) {
+        size_t temp_key_idx = (resync_pos + offset_pass2) % key_len;
+        std::vector<unsigned char> decrypted_slice = XorBytes(slice_for_offset_check, temp_key_idx);
+
+        // Check if decrypted_slice starts with END_MARKER
+        if (decrypted_slice.size() >= END_MARKER.size() &&
+            std::equal(END_MARKER.begin(), END_MARKER.end(), decrypted_slice.begin()))
+        {
+            out_resync_key_idx = temp_key_idx;
+            LogMessage(LOG_INFO_LEVEL, ("[DEBUG]   SUCCESS (Pass 2): Found valid re-sync key index: " + std::to_string(out_resync_key_idx)).c_str());
+            return true;
+        }
+    }
+
+    LogMessage(LOG_WARNING_LEVEL, "[DEBUG] Pass 2 FAILED: Could not find a valid re-sync offset.");
+    return false;
 }
 
-std::vector<unsigned char> SaveGameManager::UTF8ToLatin1(const std::string& utf8_str) {
-    std::vector<unsigned char> latin1_bytes;
-    latin1_bytes.reserve(utf8_str.length());
+// New robust decode function
+std::string SaveGameManager::DecodeAndBypass(const std::vector<unsigned char>& encrypted_bytes) {
+    std::vector<unsigned char> output_buffer;
+    output_buffer.reserve(encrypted_bytes.size());
+    size_t data_idx = 0;
+    size_t key_idx = 0;
+    size_t key_len = XOR_KEY.length();
 
-    for (size_t i = 0; i < utf8_str.length(); ) {
-        unsigned char c = utf8_str[i];
-        if (c < 0x80) {
-            latin1_bytes.push_back(c);
-            i++;
-        } else if ((c & 0xE0) == 0xC0) {
-            if (i + 1 < utf8_str.length()) {
-                unsigned char c2 = utf8_str[i + 1];
-                unsigned char original_char = ((c & 0x1F) << 6) | (c2 & 0x3F);
-                latin1_bytes.push_back(original_char);
-                i += 2;
-            } else {
-                latin1_bytes.push_back('?');
-                i++;
-            }
-        } else {
-            latin1_bytes.push_back('?');
-            i++;
-        }
+    if (key_len == 0) {
+        LogMessage(LOG_ERROR_LEVEL, "XOR_KEY length is zero. Aborting decode.");
+        return "";
     }
-    return latin1_bytes;
+
+    while (data_idx < encrypted_bytes.size()) {
+        unsigned char decrypted_byte = encrypted_bytes[data_idx] ^ XOR_KEY[key_idx % key_len];
+        output_buffer.push_back(decrypted_byte);
+
+        bool trigger_found = false;
+        for (const auto& trigger : TROUBLESOME_TRIGGERS) {
+            if (output_buffer.size() >= trigger.size()) {
+                // Check if output_buffer ends with trigger
+                if (std::equal(trigger.begin(), trigger.end(), output_buffer.end() - trigger.size())) {
+                    size_t field_start_pos = data_idx + 1;
+                    size_t field_len = 0;
+                    size_t new_key_idx = 0;
+
+                    LogMessage(LOG_INFO_LEVEL, ("[DEBUG] Trigger found at byte " + std::to_string(data_idx) + ". Starting field analysis.").c_str());
+
+                    if (FindFieldDetails(encrypted_bytes, field_start_pos, field_len, new_key_idx)) {
+                        if (field_start_pos + field_len > encrypted_bytes.size()) {
+                            LogMessage(LOG_WARNING_LEVEL, "Trigger found, but calculated field length exceeds data size. Aborting bypass.");
+                            // This is bad, we should probably fail hard.
+                            throw std::runtime_error("Trigger found, but field length calculation was invalid. Aborting.");
+                        }
+
+                        std::vector<unsigned char> field_bytes(encrypted_bytes.begin() + field_start_pos,
+                                                               encrypted_bytes.begin() + field_start_pos + field_len);
+
+                        // Rewind output buffer (remove trigger)
+                        output_buffer.resize(output_buffer.size() - trigger.size());
+                        // Re-add trigger
+                        output_buffer.insert(output_buffer.end(), trigger.begin(), trigger.end());
+
+                        // Add bypass string
+                        std::string bypass_string = BYPASS_PREFIX + BytesToHex(field_bytes) + ":" + std::to_string(new_key_idx);
+                        output_buffer.insert(output_buffer.end(), bypass_string.begin(), bypass_string.end());
+
+                        // Jump data index and set new key index
+                        data_idx = field_start_pos + field_len;
+                        key_idx = new_key_idx;
+                        trigger_found = true;
+                    } else {
+                        LogMessage(LOG_WARNING_LEVEL, "Trigger found, but could not determine field details. Aborting decode.");
+                        throw std::runtime_error("Trigger found, but FindFieldDetails failed. Aborting.");
+                    }
+                    break; // Exit trigger loop
+                }
+            }
+        } // end for triggers
+
+        if (!trigger_found) {
+            data_idx += 1;
+            key_idx += 1;
+        }
+    } // end while
+
+    // Convert final buffer to UTF-8 string
+    return std::string(output_buffer.begin(), output_buffer.end());
+}
+
+
+// New robust encode function
+std::vector<unsigned char> SaveGameManager::EncodeWithBypass(const std::string& utf8_json_string) {
+    std::vector<unsigned char> output_bytes;
+    output_bytes.reserve(utf8_json_string.length()); // Initial guess
+    size_t key_len = XOR_KEY.length();
+    size_t key_idx = 0;
+
+    if (key_len == 0) {
+        LogMessage(LOG_ERROR_LEVEL, "XOR_KEY length is zero. Aborting encode.");
+        return output_bytes;
+    }
+
+    try {
+        // Regex: BYPASSED_HEX::([a-fA-F0-9]+):(\d+)
+        std::regex pattern(BYPASS_PREFIX + "([a-fA-F0-9]+):(\\d+)");
+
+        auto it_begin = std::sregex_iterator(utf8_json_string.begin(), utf8_json_string.end(), pattern);
+        auto it_end = std::sregex_iterator();
+
+        std::string::const_iterator last_match_end = utf8_json_string.begin();
+
+        for (std::sregex_iterator i = it_begin; i != it_end; ++i) {
+            std::smatch match = *i;
+            std::string::const_iterator match_start = utf8_json_string.begin() + match.position(0);
+
+            // 1. Get the clean part *before* this match
+            std::string clean_part_str(last_match_end, match_start);
+            std::vector<unsigned char> clean_part_bytes(clean_part_str.begin(), clean_part_str.end());
+
+            // 2. Encrypt and append the clean part
+            std::vector<unsigned char> encrypted_clean_part = XorBytes(clean_part_bytes, key_idx);
+            output_bytes.insert(output_bytes.end(), encrypted_clean_part.begin(), encrypted_clean_part.end());
+
+            // 3. Update key_idx
+            key_idx = (key_idx + clean_part_bytes.size()) % key_len;
+
+            // 4. Get the bypassed data
+            std::string hex_data = match.str(1);
+            size_t new_key_idx = std::stoul(match.str(2));
+
+            // 5. Append the raw bypassed bytes (un-encrypted)
+            std::vector<unsigned char> raw_field_bytes = HexToBytes(hex_data);
+            output_bytes.insert(output_bytes.end(), raw_field_bytes.begin(), raw_field_bytes.end());
+
+            // 6. Set the new key_idx
+            key_idx = new_key_idx;
+
+            // 7. Update pointer for the next "clean part"
+            last_match_end = utf8_json_string.begin() + match.position(0) + match.length(0);
+        }
+
+        // 8. Encrypt and append any remaining part after the last match
+        std::string remaining_part_str(last_match_end, utf8_json_string.end());
+        std::vector<unsigned char> remaining_part_bytes(remaining_part_str.begin(), remaining_part_str.end());
+
+        std::vector<unsigned char> encrypted_remaining_part = XorBytes(remaining_part_bytes, key_idx);
+        output_bytes.insert(output_bytes.end(), encrypted_remaining_part.begin(), encrypted_remaining_part.end());
+
+    } catch (const std::regex_error& e) {
+         LogMessage(LOG_ERROR_LEVEL, (std::string("Regex error during encode: ") + e.what()).c_str());
+         throw; // Re-throw
+    } catch (const std::exception& e) {
+         LogMessage(LOG_ERROR_LEVEL, (std::string("Error during encode: ") + e.what()).c_str());
+         throw; // Re-throw
+    }
+    
+    return output_bytes;
 }
 
 
@@ -261,11 +428,9 @@ bool SaveGameManager::LoadSaveFile(const std::string& filepath) {
         input_file.close();
         LogMessage(LOG_INFO_LEVEL, ("Read " + std::to_string(xor_encrypted_bytes.size()) + " bytes from file.").c_str());
 
-        std::vector<unsigned char> json_bytes_latin1 = XORHybrid(xor_encrypted_bytes, XOR_KEY);
-        LogMessage(LOG_INFO_LEVEL, "XOR decrypted save file.");
-
-        std::string json_str_utf8 = Latin1ToUTF8(json_bytes_latin1);
-        LogMessage(LOG_INFO_LEVEL, "Converted byte stream to UTF-8 for parsing.");
+        // New logic:
+        std::string json_str_utf8 = DecodeAndBypass(xor_encrypted_bytes);
+        LogMessage(LOG_INFO_LEVEL, "Decoded save file with bypass logic.");
 
         m_saveData = nlohmann::json::parse(json_str_utf8);
         m_currentSaveFilePath = filepath;
@@ -328,11 +493,9 @@ bool SaveGameManager::WriteSaveFile(std::string& out_backup_filepath) {
         std::string json_to_write_utf8 = m_saveData.dump();
         LogMessage(LOG_INFO_LEVEL, "Serialized JSON data to UTF-8 string.");
         
-        std::vector<unsigned char> json_bytes_latin1 = UTF8ToLatin1(json_to_write_utf8);
-        LogMessage(LOG_INFO_LEVEL, "Converted UTF-8 string to Latin-1 bytes for encryption.");
-
-        std::vector<unsigned char> final_bytes = XORHybrid(json_bytes_latin1, XOR_KEY);
-        LogMessage(LOG_INFO_LEVEL, "XOR encrypted JSON data.");
+        // New logic:
+        std::vector<unsigned char> final_bytes = EncodeWithBypass(json_to_write_utf8);
+        LogMessage(LOG_INFO_LEVEL, "Encoded save file with bypass logic.");
 
         std::ofstream output_file(m_currentSaveFilePath, std::ios::binary | std::ios::trunc);
         if (!output_file) {
@@ -749,3 +912,4 @@ std::filesystem::path SaveGameManager::GetDefaultSaveGameDirectoryAndLatestFile(
     return steamIDPath;
 }
 //END OF SaveGameManager.cpp
+

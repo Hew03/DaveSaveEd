@@ -164,7 +164,7 @@ log: $(TARGET)
 RELEASE_DIR = releases
 # Name of the release package. Consider updating this version manually for each release.
 # Example: DaveSaveEd_v1.0.0_Win64
-RELEASE_NAME = DaveSaveEd_Release_v1.3b_Win64 # <<<--- IMPORTANT: UPDATE VERSION HERE FOR EACH RELEASE
+RELEASE_NAME = DaveSaveEd_Release_v1.4_Win64 # <<<--- IMPORTANT: UPDATE VERSION HERE FOR EACH RELEASE
 RELEASE_ZIP = $(RELEASE_DIR)\$(RELEASE_NAME).zip
 
 # Release target: Builds the project, then creates a distributable zip archive.

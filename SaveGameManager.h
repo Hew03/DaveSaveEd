@@ -74,13 +74,22 @@ private:
     bool m_isSaveFileLoaded;
 
     // --- Private Helper Methods ---
-    // The hybrid XOR function for robust encryption/decryption.
-    // *** CHANGED: Now operates on vectors of unsigned char for safety. ***
-    std::vector<unsigned char> XORHybrid(const std::vector<unsigned char>& data, const std::string& key);
+    // New robust encode/decode functions based on bypass-and-resync logic.
+    std::string DecodeAndBypass(const std::vector<unsigned char>& encrypted_data);
+    std::vector<unsigned char> EncodeWithBypass(const std::string& utf8_json_string);
 
-    // Encoding conversion helpers to ensure JSON parser receives valid UTF-8 and can be saved back correctly.
-    std::string Latin1ToUTF8(const std::vector<unsigned char>& latin1_bytes);
-    std::vector<unsigned char> UTF8ToLatin1(const std::string& utf8_str);
+    // Helper for DecodeAndBypass: Finds problematic field length and next key index.
+    bool FindFieldDetails(const std::vector<unsigned char>& encrypted_bytes, size_t start_pos,
+                          size_t& out_field_len, size_t& out_resync_key_idx);
+
+    // Helper for FindFieldDetails: Simple repeating-key XOR on a vector slice.
+    std::vector<unsigned char> XorBytes(const std::vector<unsigned char>& data_bytes, size_t key_start_index);
+    
+    // Helper for EncodeWithBypass: Converts byte vector to hex string.
+    std::string BytesToHex(const std::vector<unsigned char>& bytes);
+
+    // Helper for EncodeWithBypass: Converts hex string to byte vector.
+    std::vector<unsigned char> HexToBytes(const std::string& hex);
 
     // Zlib compression/decompression helpers
     std::string decompressZlib(const std::vector<unsigned char>& compressed_bytes);
@@ -91,4 +100,3 @@ private:
 };
 
 //END OF SaveGameManager.h
-
