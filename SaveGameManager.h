@@ -19,84 +19,85 @@
 //    misrepresented as being the original software.
 // 3. This notice may not be removed or altered from any source distribution.
 //
-// Disclaimer: This project and its creators are not affiliated with Mintrocket, Nexon,
-// or any other entities associated with the game "Dave the Diver." This is an independent
-// fan-made tool.
-//
-// This project uses third-party libraries under their respective licenses:
-// - zlib (Zlib License)
-// - nlohmann/json (MIT License)
-// - SQLite (Public Domain)
-// Full license texts can be found in the /dist/zlib, /dist/nlohmann_json, and /dist/sqlite3 directories.
-//
 #pragma once
 
 #include <string>
 #include <vector>
 #include <filesystem>
-#include "json.hpp"         // Include nlohmann/json for the JSON data
-#include "zlib.h"           // For zlib compression/decompression
-#include "sqlite3.h"        // For SQLite database operations
+
+// --- JSON ORDERING PATCH ---
+// Requires fifo_map.hpp in the include path to preserve insertion order
+#include "json.hpp"
+#include "fifo_map.hpp" 
+
+// Workaround to adapt fifo_map to the interface expected by nlohmann::basic_json
+template<class K, class V, class dummy_compare, class A>
+using my_workaround_fifo_map = nlohmann::fifo_map<K, V, nlohmann::fifo_map_compare<K>, A>;
+
+// Define a new JSON type that preserves insertion order
+using ordered_json = nlohmann::basic_json<my_workaround_fifo_map>;
+// ---------------------------
+
+// Forward declaration
+struct sqlite3;
 
 class SaveGameManager {
 public:
     SaveGameManager();
     ~SaveGameManager();
 
-    // Core Save File Operations
+    // File Operations
     bool LoadSaveFile(const std::string& filepath);
     bool WriteSaveFile(std::string& out_backup_filepath);
+    static std::filesystem::path GetDefaultSaveGameDirectoryAndLatestFile(std::string& latestSaveFileName);
 
-    // Player Stats Getters
+    // Configuration
+    void SetDebugLogging(bool enabled);
+
+    // Getters
     long long GetGold() const;
     long long GetBei() const;
     long long GetArtisansFlame() const;
     long long GetFollowerCount() const;
-    bool IsSaveFileLoaded() const { return m_isSaveFileLoaded; }
 
-    // Player Stats Setters
+    // Setters
     void SetGold(long long value);
     void SetBei(long long value);
     void SetArtisansFlame(long long value);
     void SetFollowerCount(long long value);
 
-    // Ingredient Modification Functions
+    // Ingredient Modifications
     void MaxOwnIngredients(sqlite3* db);
     void MaxAllIngredients(sqlite3* db);
 
-    // Static helper to find save directory
-    static std::filesystem::path GetDefaultSaveGameDirectoryAndLatestFile(std::string& latestSaveFileName);
+    // State
+    bool IsSaveFileLoaded() const { return m_isSaveFileLoaded; }
+    std::string GetCurrentFilePath() const { return m_currentSaveFilePath; }
 
 private:
-    // --- Member Variables ---
-    nlohmann::json m_saveData;
-    std::string m_currentSaveFilePath;
-    bool m_isSaveFileLoaded;
-
-    // --- Private Helper Methods ---
-    // New robust encode/decode functions based on bypass-and-resync logic.
-    std::string DecodeAndBypass(const std::vector<unsigned char>& encrypted_data);
+    // Helpers
+    std::string DecodeAndBypass(const std::vector<unsigned char>& encrypted_bytes);
     std::vector<unsigned char> EncodeWithBypass(const std::string& utf8_json_string);
-
-    // Helper for DecodeAndBypass: Finds problematic field length and next key index.
-    bool FindFieldDetails(const std::vector<unsigned char>& encrypted_bytes, size_t start_pos,
+    
+    // Robust Search
+    bool FindFieldDetails(const std::vector<unsigned char>& encrypted_bytes, size_t start_pos, 
                           size_t& out_field_len, size_t& out_resync_key_idx);
 
-    // Helper for FindFieldDetails: Simple repeating-key XOR on a vector slice.
     std::vector<unsigned char> XorBytes(const std::vector<unsigned char>& data_bytes, size_t key_start_index);
-    
-    // Helper for EncodeWithBypass: Converts byte vector to hex string.
     std::string BytesToHex(const std::vector<unsigned char>& bytes);
-
-    // Helper for EncodeWithBypass: Converts hex string to byte vector.
     std::vector<unsigned char> HexToBytes(const std::string& hex);
 
-    // Zlib compression/decompression helpers
-    std::string decompressZlib(const std::vector<unsigned char>& compressed_bytes);
-    std::vector<unsigned char> compressZlib(const std::string& uncompressed_json);
+    // Verification Test
+    void PerformRoundTripTest(const std::vector<unsigned char>& original_bytes, const std::string& original_path);
 
-    // Constant for the XOR key
+    // Members
+    bool m_isSaveFileLoaded;
+    bool m_debugLoggingEnabled;
+    std::string m_currentSaveFilePath;
+    
+    // --- CHANGED: Use ordered_json instead of nlohmann::json ---
+    ordered_json m_saveData; 
+    
     const std::string XOR_KEY = "GameData";
 };
-
 //END OF SaveGameManager.h

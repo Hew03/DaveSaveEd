@@ -103,6 +103,7 @@ This project uses third-party libraries under their respective licenses:
 
 * **zlib** (Zlib License)
 * **nlohmann/json** (MIT License)
+* **nlohmann/fifo_map** (MIT License)
 * **SQLite** (Public Domain)
 
-Full license texts for these libraries are provided in the `/dist/zlib`, `/dist/nlohmann_json`, and `/dist/sqlite3` directories within this repository.
+Full license texts for these libraries are provided in the `/dist/zlib`, `/dist/nlohmann_json`, `/dist/nlohmann_fifo`, and `/dist/sqlite3` directories within this repository.

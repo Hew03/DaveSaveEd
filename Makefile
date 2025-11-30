@@ -52,7 +52,7 @@ LFLAGS = # /DEBUG
 
 # Include paths for external libraries and custom headers.
 # /I: Specifies directories to add to the include search path.
-INCLUDE_PATHS = /I"dist\zlib\include" /I"dist\nlohmann_json\include" /I"dist\sqlite3\include" /I"." # Add current directory for custom headers
+INCLUDE_PATHS = /I"dist\zlib\include" /I"dist\nlohmann_json\include" /I"dist\nlohmann_fifo\include" /I"dist\sqlite3\include" /I"." # Add current directory for custom headers
 
 # Library paths for external static libraries.
 # /LIBPATH: Specifies directories to add to the library search path.
@@ -164,7 +164,7 @@ log: $(TARGET)
 RELEASE_DIR = releases
 # Name of the release package. Consider updating this version manually for each release.
 # Example: DaveSaveEd_v1.0.0_Win64
-RELEASE_NAME = DaveSaveEd_Release_v1.4_Win64 # <<<--- IMPORTANT: UPDATE VERSION HERE FOR EACH RELEASE
+RELEASE_NAME = DaveSaveEd_Release_v1.5_Win64 # <<<--- IMPORTANT: UPDATE VERSION HERE FOR EACH RELEASE
 RELEASE_ZIP = $(RELEASE_DIR)\$(RELEASE_NAME).zip
 
 # Release target: Builds the project, then creates a distributable zip archive.
