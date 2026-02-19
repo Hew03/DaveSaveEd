@@ -483,7 +483,7 @@ INT_PTR CALLBACK DialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPara
                     ofn.hwndOwner = hDlg;
                     ofn.lpstrFile = szFile;
                     ofn.nMaxFile = sizeof(szFile);
-                    ofn.lpstrFilter = "Dave the Diver Save Files (*.sav)\0*.sav\0All Files (*.*)\0*.*\0";
+                    ofn.lpstrFilter = "Dave the Diver Save Files (*.sav)\0*.sav\0Xbox Save Files\0*\0All Files (*.*)\0*.*\0";
                     ofn.nFilterIndex = 1;
                     ofn.lpstrFileTitle = NULL;
                     ofn.nMaxFileTitle = 0;
@@ -493,6 +493,10 @@ INT_PTR CALLBACK DialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPara
                     // Pre-fill the dialog with the latest save path if found.
                     if (!latestSavePath.empty()) {
                         strncpy_s(szFile, MAX_PATH, latestSavePath.c_str(), _TRUNCATE);
+                        // If it's an Xbox save (no .sav extension), switch filter to "Xbox Save Files (*)"
+                        if (latestSavePath.find(".sav") == std::string::npos) {
+                            ofn.nFilterIndex = 2;
+                        }
                     }
 
                     // Show the Open File dialog.

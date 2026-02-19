@@ -478,22 +478,26 @@ void SaveGameManager::MaxAllIngredients(sqlite3* db) {
 }
 
 std::filesystem::path SaveGameManager::GetDefaultSaveGameDirectoryAndLatestFile(std::string& latestSaveFileName) {
+    LogMessage(LOG_INFO_LEVEL, "Searching for latest save file (Steam and Xbox)...");
+    
+    // --- Steam Discovery ---
     PWSTR pszPath = NULL;
-    std::filesystem::path baseSavePath;
+    std::filesystem::path steamBaseDir;
     if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppDataLow, 0, NULL, &pszPath))) {
-        baseSavePath = pszPath; CoTaskMemFree(pszPath);
-        baseSavePath /= L"nexon"; baseSavePath /= L"DAVE THE DIVER"; baseSavePath /= L"SteamSData";
+        steamBaseDir = pszPath; CoTaskMemFree(pszPath);
+        steamBaseDir /= L"nexon"; steamBaseDir /= L"DAVE THE DIVER"; steamBaseDir /= L"SteamSData";
     } else {
         const char* localAppDataEnv = getenv("LOCALAPPDATA");
         if (localAppDataEnv) {
-             baseSavePath = localAppDataEnv;
-             baseSavePath = baseSavePath.parent_path() / "LocalLow";
-             baseSavePath /= L"nexon"; baseSavePath /= L"DAVE THE DIVER"; baseSavePath /= L"SteamSData";
+             steamBaseDir = localAppDataEnv;
+             steamBaseDir = steamBaseDir.parent_path() / "LocalLow";
+             steamBaseDir /= L"nexon"; steamBaseDir /= L"DAVE THE DIVER"; steamBaseDir /= L"SteamSData";
         }
     }
+
     std::filesystem::path steamIDPath;
-    if (std::filesystem::exists(baseSavePath)) {
-        for (const auto& entry : std::filesystem::directory_iterator(baseSavePath)) {
+    if (std::filesystem::exists(steamBaseDir)) {
+        for (const auto& entry : std::filesystem::directory_iterator(steamBaseDir)) {
             if (entry.is_directory()) {
                 std::string folderName = entry.path().filename().string();
                 if (!folderName.empty() && std::all_of(folderName.begin(), folderName.end(), ::isdigit)) {
@@ -503,10 +507,10 @@ std::filesystem::path SaveGameManager::GetDefaultSaveGameDirectoryAndLatestFile(
             }
         }
     }
-    if (steamIDPath.empty()) steamIDPath = baseSavePath;
+    if (steamIDPath.empty()) steamIDPath = steamBaseDir;
     
-    std::filesystem::file_time_type lastWriteTime;
-    std::filesystem::path mostRecentSaveFile;
+    std::filesystem::file_time_type latestSteamTime;
+    std::filesystem::path latestSteamFile;
     if (std::filesystem::exists(steamIDPath)) {
         for (const auto& entry : std::filesystem::directory_iterator(steamIDPath)) {
             if (entry.is_regular_file()) {
@@ -514,15 +518,82 @@ std::filesystem::path SaveGameManager::GetDefaultSaveGameDirectoryAndLatestFile(
                 bool is_autosave = (fileName.find("GameSave") == 0 && fileName.find("_GD.sav") != std::string::npos);
                 bool is_manual_save = (fileName.find("m_") == 0 && fileName.find(".sav") != std::string::npos);
                 if (is_autosave || is_manual_save) {
-                    if (mostRecentSaveFile.empty() || std::filesystem::last_write_time(entry.path()) > lastWriteTime) {
-                        lastWriteTime = std::filesystem::last_write_time(entry.path());
-                        mostRecentSaveFile = entry.path();
+                    auto ftime = std::filesystem::last_write_time(entry.path());
+                    if (latestSteamFile.empty() || ftime > latestSteamTime) {
+                        latestSteamTime = ftime;
+                        latestSteamFile = entry.path();
                     }
                 }
             }
         }
     }
-    if (!mostRecentSaveFile.empty()) latestSaveFileName = mostRecentSaveFile.string();
-    return steamIDPath;
+
+    // --- Xbox Discovery ---
+    std::filesystem::path xboxBaseDir;
+    const char* localAppDataValue = getenv("LOCALAPPDATA");
+    if (localAppDataValue) {
+        std::filesystem::path packagesDir = std::filesystem::path(localAppDataValue) / "Packages";
+        if (std::filesystem::exists(packagesDir)) {
+            for (const auto& entry : std::filesystem::directory_iterator(packagesDir)) {
+                if (entry.is_directory() && entry.path().filename().string().find("Mintrocket.DaveTheDiver") == 0) {
+                    xboxBaseDir = entry.path() / "SystemAppData" / "wgs";
+                    break;
+                }
+            }
+        }
+    }
+
+    std::filesystem::file_time_type latestXboxTime;
+    std::filesystem::path latestXboxFile;
+    std::filesystem::path xboxActiveDir;
+
+    if (!xboxBaseDir.empty() && std::filesystem::exists(xboxBaseDir)) {
+        try {
+            // Xbox saves are in subdirectories with "crazy numbers"
+            for (const auto& dirEntry : std::filesystem::recursive_directory_iterator(xboxBaseDir)) {
+                if (dirEntry.is_regular_file()) {
+                    std::string fileName = dirEntry.path().filename().string();
+                    // Skip containers.index and small metadata files
+                    if (fileName == "containers.index" || fileName.find("container.") == 0) continue;
+                    
+                    // Xbox save files are usually large hex strings and fairly large
+                    if (std::filesystem::file_size(dirEntry.path()) > 1024) { 
+                        auto ftime = std::filesystem::last_write_time(dirEntry.path());
+                        if (latestXboxFile.empty() || ftime > latestXboxTime) {
+                            latestXboxTime = ftime;
+                            latestXboxFile = dirEntry.path();
+                            xboxActiveDir = dirEntry.path().parent_path();
+                        }
+                    }
+                }
+            }
+        } catch (...) {
+            LogMessage(LOG_ERROR_LEVEL, "Error iterating Xbox save directory.");
+        }
+    }
+
+    // --- Compare and Select ---
+    if (!latestSteamFile.empty() && !latestXboxFile.empty()) {
+        if (latestXboxTime > latestSteamTime) {
+            LogMessage(LOG_INFO_LEVEL, "Latest save is XBOX version.");
+            latestSaveFileName = latestXboxFile.string();
+            return xboxActiveDir;
+        } else {
+            LogMessage(LOG_INFO_LEVEL, "Latest save is STEAM version.");
+            latestSaveFileName = latestSteamFile.string();
+            return steamIDPath;
+        }
+    } else if (!latestXboxFile.empty()) {
+        LogMessage(LOG_INFO_LEVEL, "Only XBOX save found.");
+        latestSaveFileName = latestXboxFile.string();
+        return xboxActiveDir;
+    } else if (!latestSteamFile.empty()) {
+        LogMessage(LOG_INFO_LEVEL, "Only STEAM save found.");
+        latestSaveFileName = latestSteamFile.string();
+        return steamIDPath;
+    }
+
+    LogMessage(LOG_INFO_LEVEL, "No save files found.");
+    return steamIDPath; // Fallback to steam base path even if empty
 }
 //END OF SaveGameManager.cpp
