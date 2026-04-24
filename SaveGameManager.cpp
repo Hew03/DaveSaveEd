@@ -405,6 +405,17 @@ void SaveGameManager::SetBei(long long value) { m_saveData["PlayerInfo"]["m_Bei"
 void SaveGameManager::SetArtisansFlame(long long value) { m_saveData["PlayerInfo"]["m_ChefFlame"] = std::min(value, SAVE_MAX_CURRENCY); }
 void SaveGameManager::SetFollowerCount(long long value) { m_saveData["SNSInfo"]["m_Follow_Count"] = value; }
 
+// Returns the current count of a specific ingredient in the loaded save, or 0 if not present.
+int SaveGameManager::GetIngredientCount(int ingredientID) const {
+    if (!m_isSaveFileLoaded) return 0;
+    std::string key = std::to_string(ingredientID);
+    if (m_saveData["Ingredients"].contains(key) &&
+        m_saveData["Ingredients"][key].contains("count")) {
+        return m_saveData["Ingredients"][key]["count"].get<int>();
+    }
+    return 0;
+}
+
 // --- Ingredients Helpers ---
 static int GetDesiredMaxCountForTier(int item_db_max_count) {
     if (item_db_max_count >= 9999) return 6666;
@@ -475,6 +486,49 @@ void SaveGameManager::MaxAllIngredients(sqlite3* db) {
         }
     }
     sqlite3_finalize(stmt);
+}
+
+bool SaveGameManager::SetSpecificIngredient(int ingredientID, int amount, sqlite3* db) {
+    if (!m_isSaveFileLoaded) return false;
+
+    std::string key = std::to_string(ingredientID);
+    
+    // 1. Check if the ingredient already exists in the save data
+    if (m_saveData["Ingredients"].contains(key)) {
+        m_saveData["Ingredients"][key]["count"] = amount;
+        return true;
+    } 
+    
+    // 2. If it doesn't exist, use the reference DB to create a valid new entry
+    if (db) {
+        sqlite3_stmt *stmt = nullptr;
+        // We select ItemDataID specifically to ensure the ID is valid in the game's database
+        sqlite3_prepare_v2(db, "SELECT ItemDataID FROM Items WHERE ItemDataID = ?;", -1, &stmt, NULL);
+        sqlite3_bind_int(stmt, 1, ingredientID);
+        
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            int parentId = sqlite3_column_int(stmt, 0);
+            
+            // Create a fresh entry with default values the game expects
+            ordered_json entry;
+            entry["ingredientsID"] = ingredientID;
+            entry["parentID"] = parentId;
+            entry["count"] = amount;
+            entry["level"] = 1;
+            entry["branchCount"] = 0;
+            entry["isNew"] = true;
+            entry["placeTagMask"] = 1;
+            entry["lastGainTime"] = "04/01/2026 12:00:00"; // Current project year context
+            entry["lastGainGameTime"] = "10/03/2022 08:30:52";
+            
+            m_saveData["Ingredients"][key] = entry;
+            sqlite3_finalize(stmt);
+            return true;
+        }
+        sqlite3_finalize(stmt);
+    }
+    
+    return false;
 }
 
 std::filesystem::path SaveGameManager::GetDefaultSaveGameDirectoryAndLatestFile(std::string& latestSaveFileName) {
@@ -596,4 +650,5 @@ std::filesystem::path SaveGameManager::GetDefaultSaveGameDirectoryAndLatestFile(
     LogMessage(LOG_INFO_LEVEL, "No save files found.");
     return steamIDPath; // Fallback to steam base path even if empty
 }
+
 //END OF SaveGameManager.cpp

@@ -42,3 +42,5 @@ bin/
 #archives
 releases/
 *.zip
+
+dist/zlib/*

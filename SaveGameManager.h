@@ -59,6 +59,7 @@ public:
     long long GetBei() const;
     long long GetArtisansFlame() const;
     long long GetFollowerCount() const;
+    int GetIngredientCount(int ingredientID) const;
 
     // Setters
     void SetGold(long long value);
@@ -69,6 +70,7 @@ public:
     // Ingredient Modifications
     void MaxOwnIngredients(sqlite3* db);
     void MaxAllIngredients(sqlite3* db);
+    bool SetSpecificIngredient(int ingredientID, int amount, sqlite3* db);
 
     // State
     bool IsSaveFileLoaded() const { return m_isSaveFileLoaded; }

@@ -79,8 +79,15 @@
 #define IDC_BTN_LOAD_SAVE           112
 #define IDC_BTN_WRITE_SAVE          113
 
+#define IDC_COMBO_INGREDIENTS       117
+#define IDC_EDIT_ING_AMOUNT         118
+#define IDC_BTN_SET_ING_AMOUNT      119
+
 // --- Global Window Handles ---
 HWND g_hDlg = NULL; // Handle to the main dialog window.
+
+HWND g_hComboIngredients = NULL;
+HWND g_hEditIngAmount = NULL;
 
 // Handles to the static text controls that display currency values.
 HWND g_hStaticGoldValue = NULL;
@@ -178,7 +185,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         "DaveSaveEd",                       // NEW: Window title changed to "DaveSaveEd".
         WS_OVERLAPPEDWINDOW | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, // Window styles.
         CW_USEDEFAULT, CW_USEDEFAULT,       // Default position.
-        450, 340,                           // Initial size.
+        450, 400,                           // Initial size (height increased to fit ingredient scan row).
         NULL,                               // Parent window.
         NULL,                               // Menu handle.
         hInstance,                          // Application instance.
@@ -335,10 +342,12 @@ INT_PTR CALLBACK DialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPara
             // Calculate total height needed for all UI blocks.
             int total_currency_block_height = (control_height * 4) + (spacing_y * 3);
             int total_ingredient_block_height = control_height;
+            int total_ingredient_scan_height = control_height; // Combo/edit/set row for individual ingredient editing.
             int total_file_block_height = control_height + 5; // +5 for slight extra spacing.
 
             int total_ui_elements_height = total_currency_block_height + section_spacing_y +
                                            total_ingredient_block_height + section_spacing_y +
+                                           total_ingredient_scan_height + section_spacing_y +
                                            total_file_block_height;
 
             // Calculate initial Y position to vertically center the UI elements.
@@ -396,7 +405,44 @@ INT_PTR CALLBACK DialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPara
                 ing_x_start + ing_btn_width + ing_btn_spacing, y_pos, ing_btn_width, control_height, hDlg, (HMENU)IDC_BTN_MAX_ALL_INGREDIENTS, GetModuleHandle(NULL), NULL);
             y_pos += control_height + section_spacing_y;
 
+            int combo_width = 180;
+            int amount_width = 60;
+            int set_btn_width = 80;
+            int manual_row_total = combo_width + amount_width + set_btn_width + 20;
+            int manual_x_start = (dialog_client_width - manual_row_total) / 2;
+
+            g_hComboIngredients = CreateWindowEx(0, "COMBOBOX", "", 
+                WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+                manual_x_start, y_pos, combo_width, 200, hDlg, (HMENU)IDC_COMBO_INGREDIENTS, GetModuleHandle(NULL), NULL);
+
+            g_hEditIngAmount = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "1", 
+                WS_CHILD | WS_VISIBLE | ES_NUMBER,
+                manual_x_start + combo_width + 10, y_pos, amount_width, control_height, hDlg, (HMENU)IDC_EDIT_ING_AMOUNT, GetModuleHandle(NULL), NULL);
+
+            CreateWindowEx(0, "BUTTON", "Set", 
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                manual_x_start + combo_width + amount_width + 20, y_pos, set_btn_width, control_height, hDlg, (HMENU)IDC_BTN_SET_ING_AMOUNT, GetModuleHandle(NULL), NULL);
+
+            // Populate the ComboBox from the Reference DB.
+            // The reference DB has no display-name column, so entries show the numeric ingredient ID.
+            // The raw ID is also stored as item data so the Set handler can retrieve it directly.
+            if (g_refDb) {
+                sqlite3_stmt* pStmt;
+                const char* sql = "SELECT I.TID FROM Ingredients I JOIN Items T ON I.TID = T.ItemDataID ORDER BY I.TID ASC";
+                if (sqlite3_prepare_v2(g_refDb, sql, -1, &pStmt, NULL) == SQLITE_OK) {
+                    while (sqlite3_step(pStmt) == SQLITE_ROW) {
+                        int id = sqlite3_column_int(pStmt, 0);
+                        std::string idStr = std::to_string(id);
+                        int index = ComboBox_AddString(g_hComboIngredients, idStr.c_str());
+                        // Store the raw ID so the Set handler can retrieve it without re-parsing the string.
+                        ComboBox_SetItemData(g_hComboIngredients, index, id);
+                    }
+                    sqlite3_finalize(pStmt);
+                }
+            }
+
             // Create File Operation UI Elements.
+            y_pos += control_height + section_spacing_y; // Advance past the ingredient scan row.
             int file_x_start = (dialog_client_width - file_row_total_width) / 2;
 
             CreateWindowEx(0, "BUTTON", "Load Save File...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
@@ -469,6 +515,46 @@ INT_PTR CALLBACK DialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPara
                         MessageBox(hDlg, "No save file loaded or valid data to modify!", "Error", MB_ICONWARNING | MB_OK);
                     }
                     break;
+                case IDC_COMBO_INGREDIENTS:
+                    // When the user picks a different ingredient, pre-fill the amount field
+                    // with whatever count is already in the loaded save, or 0 if not present.
+                    if (HIWORD(wParam) == CBN_SELCHANGE) {
+                        int selIdx = ComboBox_GetCurSel(g_hComboIngredients);
+                        if (selIdx != CB_ERR && g_saveGameManager.IsSaveFileLoaded()) {
+                            int ingredientID = (int)ComboBox_GetItemData(g_hComboIngredients, selIdx);
+                            int currentCount = g_saveGameManager.GetIngredientCount(ingredientID);
+                            SetWindowTextA(g_hEditIngAmount, std::to_string(currentCount).c_str());
+                        }
+                    }
+                    break;
+
+                case IDC_BTN_SET_ING_AMOUNT: {
+                    if (!g_saveGameManager.IsSaveFileLoaded()) {
+                        MessageBox(hDlg, "Load a save file first!", "Error", MB_ICONWARNING | MB_OK);
+                        break;
+                    }
+
+                    int selIdx = ComboBox_GetCurSel(g_hComboIngredients);
+                    if (selIdx == CB_ERR) {
+                        MessageBox(hDlg, "Select an ingredient ID first!", "Error", MB_ICONWARNING | MB_OK);
+                        break;
+                    }
+
+                    // Get ID from combo and Amount from edit box
+                    int ingredientID = (int)ComboBox_GetItemData(g_hComboIngredients, selIdx);
+                    char buf[16];
+                    GetWindowTextA(g_hEditIngAmount, buf, 16);
+                    int amount = atoi(buf);
+
+                    // Call the manager to update
+                    if (g_saveGameManager.SetSpecificIngredient(ingredientID, amount, g_refDb)) {
+                        LogMessage(LOG_INFO_LEVEL, "Manually updated ingredient.");
+                        MessageBox(hDlg, "Ingredient updated!", "Success", MB_ICONINFORMATION | MB_OK);
+                    } else {
+                        MessageBox(hDlg, "Failed to update. Ingredient might not exist in save.", "Error", MB_ICONERROR | MB_OK);
+                    }
+                    break;
+                }
                 case IDC_BTN_LOAD_SAVE: {
                     LogMessage(LOG_INFO_LEVEL, "Load Save File button clicked.");
                     std::string latestSavePath;
@@ -557,4 +643,3 @@ INT_PTR CALLBACK DialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPara
             return DefWindowProc(hDlg, message, wParam, lParam);
     }
 }
-
