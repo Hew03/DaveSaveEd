@@ -31,6 +31,7 @@
 //
 #include <windows.h>    // Basic Windows API functions
 #include <windowsx.h>   // For GET_WM_COMMAND_ID macro
+#include <strsafe.h>    // For StringCbCopyA (safe string copy for font face name)
 #include <string>       // For std::string
 #include <filesystem>   // For std::filesystem (C++17 for path manipulation) - Kept for std::filesystem::path
 #include <string.h>     // For strstr (for parsing command-line arguments)
@@ -109,38 +110,159 @@ SaveGameManager g_saveGameManager;
 // Global brush for painting the dialog background color.
 HBRUSH g_hBackgroundBrush = NULL;
 
-// --- Forward Declarations ---
-// Main dialog procedure callback function.
-INT_PTR CALLBACK DialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam);
-// Function to update the currency display on the UI from the loaded save data.
-void UpdateCurrencyDisplay();
+// Global fonts — created once in WM_CREATE, destroyed in WM_DESTROY.
+HFONT g_hFont        = NULL; // Standard UI font (Segoe UI 9pt)
+HFONT g_hFontBold    = NULL; // Bold variant for group-box section headers
+HFONT g_hFontSmall   = NULL; // Small font for status bar
 
-// --- Function to update currency edit fields ---
-// Retrieves currency values from the SaveGameManager and updates the corresponding UI controls.
+// Status bar at the bottom of the window.
+HWND g_hStatusBar = NULL;
+
+// Write Save button — kept globally so it can be enabled/disabled with the save state.
+HWND g_hBtnWriteSave = NULL;
+HWND g_hBtnLoadSave  = NULL;
+
+// Group box handles (needed by DoLayout for repositioning).
+HWND g_hGbResources   = NULL;
+HWND g_hGbIngredients = NULL;
+
+// Label handles (needed by DoLayout).
+HWND g_hLblGold     = NULL;
+HWND g_hLblBei      = NULL;
+HWND g_hLblFlame    = NULL;
+HWND g_hLblFollower = NULL;
+
+// --- Forward Declarations ---
+INT_PTR CALLBACK DialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam);
+void UpdateCurrencyDisplay();
+void DoLayout(HWND hDlg, int W, int H);
+
+// Helper: apply a font to a single child window (used with EnumChildWindows).
+static BOOL CALLBACK SetChildFont(HWND hChild, LPARAM lParam) {
+    SendMessage(hChild, WM_SETFONT, (WPARAM)lParam, TRUE);
+    return TRUE;
+}
+
+// --- UpdateCurrencyDisplay ---
+// Pulls values from SaveGameManager into the edit controls and
+// enables/disables all editable fields + the Write button accordingly.
 void UpdateCurrencyDisplay() {
-    if (g_saveGameManager.IsSaveFileLoaded()) {
+    bool loaded = g_saveGameManager.IsSaveFileLoaded();
+
+    if (loaded) {
         SetWindowTextA(g_hEditGoldValue,     std::to_string(g_saveGameManager.GetGold()).c_str());
         SetWindowTextA(g_hEditBeiValue,      std::to_string(g_saveGameManager.GetBei()).c_str());
         SetWindowTextA(g_hEditFlameValue,    std::to_string(g_saveGameManager.GetArtisansFlame()).c_str());
         SetWindowTextA(g_hEditFollowerValue, std::to_string(g_saveGameManager.GetFollowerCount()).c_str());
-        // Enable editing now that a save is loaded.
-        EnableWindow(g_hEditGoldValue,     TRUE);
-        EnableWindow(g_hEditBeiValue,      TRUE);
-        EnableWindow(g_hEditFlameValue,    TRUE);
-        EnableWindow(g_hEditFollowerValue, TRUE);
+        // Show short filename in status bar.
+        std::string path = g_saveGameManager.GetCurrentFilePath();
+        size_t slash = path.find_last_of("\\/");
+        std::string name = (slash != std::string::npos) ? path.substr(slash + 1) : path;
+        std::string status = "  Loaded: " + name;
+        if (g_hStatusBar) SetWindowTextA(g_hStatusBar, status.c_str());
         LogMessage(LOG_INFO_LEVEL, "Currency display updated from SaveGameManager values.");
     } else {
         SetWindowTextA(g_hEditGoldValue,     "");
         SetWindowTextA(g_hEditBeiValue,      "");
         SetWindowTextA(g_hEditFlameValue,    "");
         SetWindowTextA(g_hEditFollowerValue, "");
-        // Disable editing until a save is loaded.
-        EnableWindow(g_hEditGoldValue,     FALSE);
-        EnableWindow(g_hEditBeiValue,      FALSE);
-        EnableWindow(g_hEditFlameValue,    FALSE);
-        EnableWindow(g_hEditFollowerValue, FALSE);
+        if (g_hStatusBar) SetWindowTextA(g_hStatusBar, "  No save file loaded.");
         LogMessage(LOG_INFO_LEVEL, "No valid save data loaded. Displaying blank currency values.");
     }
+
+    EnableWindow(g_hEditGoldValue,     loaded ? TRUE : FALSE);
+    EnableWindow(g_hEditBeiValue,      loaded ? TRUE : FALSE);
+    EnableWindow(g_hEditFlameValue,    loaded ? TRUE : FALSE);
+    EnableWindow(g_hEditFollowerValue, loaded ? TRUE : FALSE);
+    if (g_hBtnWriteSave) EnableWindow(g_hBtnWriteSave, loaded ? TRUE : FALSE);
+}
+
+// --- DoLayout ---
+// Repositions and resizes all child controls to fit the given client area (W x H).
+// Called from WM_CREATE (initial pass) and WM_SIZE (every resize) for full responsiveness.
+void DoLayout(HWND hDlg, int W, int H) {
+    const int MARGIN      = 16;       // outer left/right margin
+    const int PAD         = 12;       // inner group-box padding
+    const int ROW_H       = 26;       // control height
+    const int ROW_GAP     = 8;        // vertical gap between rows
+    const int SEC_GAP     = 14;       // vertical gap between sections
+    const int LBL_W       = 118;      // label column width (left-anchored)
+    const int EDIT_W      = 110;      // value edit width (right-anchored)
+    const int BTN_W       = 64;       // "Set" button width (right-anchored)
+    const int SBAR_H      = 22;       // status bar height
+    const int FILE_BTN_H  = ROW_H + 4;
+    const int ING_BTN_W   = 64;
+    const int ING_EDIT_W  = 70;
+    const int ING_GAP     = 8;
+
+    // Horizontal anchors — group box spans full width minus margins.
+    int GB_W        = W - MARGIN * 2;
+    int GB_INNER_X  = MARGIN + PAD;
+
+    // Resources section: edit + button right-anchored inside group box.
+    int GB_BTN_X    = MARGIN + GB_W - PAD - BTN_W;
+    int GB_EDIT_X   = GB_BTN_X - 8 - EDIT_W;
+
+    // Ingredients section: combo/search fill left side; amount edit + Set button right-anchored.
+    int ing_x           = MARGIN + PAD;
+    int ing_right       = MARGIN + GB_W - PAD;
+    int ing_set_btn_x   = ing_right - ING_BTN_W;
+    int ing_edit_x      = ing_set_btn_x - ING_GAP - ING_EDIT_W;
+    int ING_COMBO_W     = ing_edit_x - ING_GAP - ing_x;
+
+    // Vertical layout: fixed-height sections stacked from top; file buttons above status bar.
+    int res_gb_inner_h  = PAD + (ROW_H + ROW_GAP) * 4 - ROW_GAP + PAD;
+    int ing_gb_inner_h  = PAD + (ROW_H + ROW_GAP) * 2 - ROW_GAP + PAD;
+    int res_gb_y        = MARGIN;
+    int ing_gb_y        = res_gb_y + res_gb_inner_h + 18 + SEC_GAP;
+    int file_y          = H - SBAR_H - SEC_GAP - FILE_BTN_H;
+    int half_w          = (GB_W - 8) / 2;
+
+    // Batch all moves to eliminate flicker during resize.
+    HDWP hdwp = BeginDeferWindowPos(24);
+    if (!hdwp) return;
+
+    auto Move = [&](HWND hw, int x, int y, int w, int h) {
+        if (hw) hdwp = DeferWindowPos(hdwp, hw, NULL, x, y, w, h,
+                                       SWP_NOZORDER | SWP_NOACTIVATE);
+    };
+
+    // --- Resources group box ---
+    Move(g_hGbResources, MARGIN, res_gb_y, GB_W, res_gb_inner_h + 18);
+    int ry = res_gb_y + 22;
+    Move(g_hLblGold,                              GB_INNER_X, ry, LBL_W, ROW_H);
+    Move(g_hEditGoldValue,                        GB_EDIT_X,  ry, EDIT_W, ROW_H);
+    Move(GetDlgItem(hDlg, IDC_BTN_SET_GOLD),      GB_BTN_X,   ry, BTN_W,  ROW_H);
+    ry += ROW_H + ROW_GAP;
+    Move(g_hLblBei,                               GB_INNER_X, ry, LBL_W, ROW_H);
+    Move(g_hEditBeiValue,                         GB_EDIT_X,  ry, EDIT_W, ROW_H);
+    Move(GetDlgItem(hDlg, IDC_BTN_SET_BEI),       GB_BTN_X,   ry, BTN_W,  ROW_H);
+    ry += ROW_H + ROW_GAP;
+    Move(g_hLblFlame,                             GB_INNER_X, ry, LBL_W, ROW_H);
+    Move(g_hEditFlameValue,                       GB_EDIT_X,  ry, EDIT_W, ROW_H);
+    Move(GetDlgItem(hDlg, IDC_BTN_SET_FLAME),     GB_BTN_X,   ry, BTN_W,  ROW_H);
+    ry += ROW_H + ROW_GAP;
+    Move(g_hLblFollower,                          GB_INNER_X, ry, LBL_W, ROW_H);
+    Move(g_hEditFollowerValue,                    GB_EDIT_X,  ry, EDIT_W, ROW_H);
+    Move(GetDlgItem(hDlg, IDC_BTN_SET_FOLLOWER),  GB_BTN_X,   ry, BTN_W,  ROW_H);
+
+    // --- Ingredients group box ---
+    Move(g_hGbIngredients, MARGIN, ing_gb_y, GB_W, ing_gb_inner_h + 18);
+    int iy = ing_gb_y + 22;
+    Move(g_hEditIngSearch,                              ing_x,        iy, ING_COMBO_W, ROW_H);
+    iy += ROW_H + ROW_GAP;
+    Move(g_hComboIngredients,                           ing_x,        iy, ING_COMBO_W, ROW_H);
+    Move(g_hEditIngAmount,                              ing_edit_x,   iy, ING_EDIT_W,  ROW_H);
+    Move(GetDlgItem(hDlg, IDC_BTN_SET_ING_AMOUNT),     ing_set_btn_x,iy, ING_BTN_W,   ROW_H);
+
+    // --- File buttons ---
+    Move(g_hBtnLoadSave,  MARGIN,              file_y, half_w, FILE_BTN_H);
+    Move(g_hBtnWriteSave, MARGIN + half_w + 8, file_y, half_w, FILE_BTN_H);
+
+    // --- Status bar ---
+    Move(g_hStatusBar, 0, H - SBAR_H, W, SBAR_H);
+
+    EndDeferWindowPos(hdwp);
 }
 
 // --- Entry Point: WinMain ---
@@ -187,9 +309,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         WS_EX_APPWINDOW | WS_EX_WINDOWEDGE, // Extended window styles.
         "DaveSaveEdDialogClass",            // Class name.
         "DaveSaveEd",                       // NEW: Window title changed to "DaveSaveEd".
-        WS_OVERLAPPEDWINDOW | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, // Window styles.
+        WS_OVERLAPPEDWINDOW | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME | WS_MAXIMIZEBOX, // Window styles.
         CW_USEDEFAULT, CW_USEDEFAULT,       // Default position.
-        450, 360,                           // Initial size (height reduced after removing max-ingredient buttons).
+        520, 480,                           // Window size — wider for grouped layout with status bar.
         NULL,                               // Parent window.
         NULL,                               // Menu handle.
         hInstance,                          // Application instance.
@@ -313,125 +435,125 @@ INT_PTR CALLBACK DialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPara
                 }
             }
 
-            // --- Create UI Elements (Centered Layout) ---
-            // Defines dimensions and spacing for UI controls to achieve a centered layout.
-            int control_height = 24;
-            int spacing_y = 10;
-            int section_spacing_y = 15;
+            // --- Create Fonts ---
+            LOGFONTA lf = {};
+            lf.lfHeight         = -MulDiv(9, GetDeviceCaps(GetDC(hDlg), LOGPIXELSY), 72);
+            lf.lfWeight         = FW_NORMAL;
+            lf.lfCharSet        = DEFAULT_CHARSET;
+            lf.lfQuality        = CLEARTYPE_QUALITY;
+            lf.lfPitchAndFamily = DEFAULT_PITCH | FF_DONTCARE;
+            StringCbCopyA(lf.lfFaceName, sizeof(lf.lfFaceName), "Segoe UI");
+            g_hFont = CreateFontIndirectA(&lf);
 
-            int label_width = 110;
-            int value_width = 100;
-            int currency_button_width = 120;
-            int spacing_x_currency_row = 10;
+            lf.lfWeight = FW_SEMIBOLD;
+            g_hFontBold = CreateFontIndirectA(&lf);
 
-            int ing_btn_width = 170;
-            int ing_btn_spacing = 20;
+            lf.lfWeight = FW_NORMAL;
+            lf.lfHeight = -MulDiv(8, GetDeviceCaps(GetDC(hDlg), LOGPIXELSY), 72);
+            g_hFontSmall = CreateFontIndirectA(&lf);
 
-            int file_btn_width = 150;
-            int file_btn_spacing = 20;
+            // --- Layout constants ---
+            RECT cr; GetClientRect(hDlg, &cr);
+            int W = cr.right - cr.left;
+            int H = cr.bottom - cr.top;
 
-            // Calculate total widths for horizontal centering.
-            int currency_row_total_width = label_width + spacing_x_currency_row + value_width + spacing_x_currency_row + currency_button_width;
-            int ingredient_row_total_width = ing_btn_width * 2 + ing_btn_spacing;
-            int file_row_total_width = file_btn_width * 2 + file_btn_spacing;
+            // --- Section 1: Resources group box ---
+            // All controls are created at 0,0,0,0 — DoLayout positions them.
+            g_hGbResources = CreateWindowEx(0, "BUTTON", "Resources",
+                WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+                0, 0, 0, 0,
+                hDlg, NULL, GetModuleHandle(NULL), NULL);
 
-            RECT client_rect;
-            GetClientRect(hDlg, &client_rect);
-            int dialog_client_width = client_rect.right - client_rect.left;
-            int dialog_client_height = client_rect.bottom - client_rect.top;
-
-            // Calculate total height needed for all UI blocks.
-            int total_currency_block_height = (control_height * 4) + (spacing_y * 3);
-            // No separate max-ingredient button row any more.
-            int total_ingredient_search_height = control_height; // Search filter box above the combo.
-            int total_ingredient_scan_height = control_height;   // Combo/edit/set row for individual editing.
-            int total_file_block_height = control_height + 5;    // +5 for slight extra spacing.
-
-            int total_ui_elements_height = total_currency_block_height + section_spacing_y +
-                                           total_ingredient_search_height + spacing_y +
-                                           total_ingredient_scan_height + section_spacing_y +
-                                           total_file_block_height;
-
-            // Calculate initial Y position to vertically center the UI elements.
-            int y_pos_start = (dialog_client_height - total_ui_elements_height) / 2;
-            if (y_pos_start < 10) y_pos_start = 10; // Ensure a minimum top margin.
-
-            int y_pos = y_pos_start; // Current Y position for placing controls.
-
-            // Calculate X start positions for horizontal centering of each row type.
-            int currency_x_start = (dialog_client_width - currency_row_total_width) / 2;
-            int current_label_x = currency_x_start;
-            int current_value_x = currency_x_start + label_width + spacing_x_currency_row;
-            int current_button_x = current_value_x + value_width + spacing_x_currency_row;
-
-            // Create Currency UI Elements.
-            // Each row: label | editable value (ES_NUMBER) | "Set" button
-            CreateWindowEx(WS_EX_TRANSPARENT, "STATIC", "Gold:", WS_CHILD | WS_VISIBLE,
-                current_label_x, y_pos, label_width, control_height, hDlg, (HMENU)IDC_STATIC_GOLD_LABEL, GetModuleHandle(NULL), NULL);
-            g_hEditGoldValue = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_AUTOHSCROLL,
-                current_value_x, y_pos, value_width, control_height, hDlg, (HMENU)IDC_EDIT_GOLD_VALUE, GetModuleHandle(NULL), NULL);
+            // Gold
+            g_hLblGold = CreateWindowEx(WS_EX_TRANSPARENT, "STATIC", "Gold",
+                WS_CHILD | WS_VISIBLE | SS_LEFT,
+                0, 0, 0, 0, hDlg,
+                (HMENU)IDC_STATIC_GOLD_LABEL, GetModuleHandle(NULL), NULL);
+            g_hEditGoldValue = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "",
+                WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_AUTOHSCROLL,
+                0, 0, 0, 0, hDlg,
+                (HMENU)IDC_EDIT_GOLD_VALUE, GetModuleHandle(NULL), NULL);
             EnableWindow(g_hEditGoldValue, FALSE);
-            CreateWindowEx(0, "BUTTON", "Set", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                current_button_x, y_pos, currency_button_width, control_height, hDlg, (HMENU)IDC_BTN_SET_GOLD, GetModuleHandle(NULL), NULL);
-            y_pos += control_height + spacing_y;
+            CreateWindowEx(0, "BUTTON", "Set",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                0, 0, 0, 0, hDlg,
+                (HMENU)IDC_BTN_SET_GOLD, GetModuleHandle(NULL), NULL);
 
-            CreateWindowEx(WS_EX_TRANSPARENT, "STATIC", "Bei:", WS_CHILD | WS_VISIBLE,
-                current_label_x, y_pos, label_width, control_height, hDlg, (HMENU)IDC_STATIC_BEI_LABEL, GetModuleHandle(NULL), NULL);
-            g_hEditBeiValue = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_AUTOHSCROLL,
-                current_value_x, y_pos, value_width, control_height, hDlg, (HMENU)IDC_EDIT_BEI_VALUE, GetModuleHandle(NULL), NULL);
+            // Bei
+            g_hLblBei = CreateWindowEx(WS_EX_TRANSPARENT, "STATIC", "Bei",
+                WS_CHILD | WS_VISIBLE | SS_LEFT,
+                0, 0, 0, 0, hDlg,
+                (HMENU)IDC_STATIC_BEI_LABEL, GetModuleHandle(NULL), NULL);
+            g_hEditBeiValue = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "",
+                WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_AUTOHSCROLL,
+                0, 0, 0, 0, hDlg,
+                (HMENU)IDC_EDIT_BEI_VALUE, GetModuleHandle(NULL), NULL);
             EnableWindow(g_hEditBeiValue, FALSE);
-            CreateWindowEx(0, "BUTTON", "Set", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                current_button_x, y_pos, currency_button_width, control_height, hDlg, (HMENU)IDC_BTN_SET_BEI, GetModuleHandle(NULL), NULL);
-            y_pos += control_height + spacing_y;
+            CreateWindowEx(0, "BUTTON", "Set",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                0, 0, 0, 0, hDlg,
+                (HMENU)IDC_BTN_SET_BEI, GetModuleHandle(NULL), NULL);
 
-            CreateWindowEx(WS_EX_TRANSPARENT, "STATIC", "Artisan's Flame:", WS_CHILD | WS_VISIBLE,
-                current_label_x, y_pos, label_width, control_height, hDlg, (HMENU)IDC_STATIC_FLAME_LABEL, GetModuleHandle(NULL), NULL);
-            g_hEditFlameValue = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_AUTOHSCROLL,
-                current_value_x, y_pos, value_width, control_height, hDlg, (HMENU)IDC_EDIT_FLAME_VALUE, GetModuleHandle(NULL), NULL);
+            // Artisan's Flame
+            g_hLblFlame = CreateWindowEx(WS_EX_TRANSPARENT, "STATIC", "Artisan's Flame",
+                WS_CHILD | WS_VISIBLE | SS_LEFT,
+                0, 0, 0, 0, hDlg,
+                (HMENU)IDC_STATIC_FLAME_LABEL, GetModuleHandle(NULL), NULL);
+            g_hEditFlameValue = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "",
+                WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_AUTOHSCROLL,
+                0, 0, 0, 0, hDlg,
+                (HMENU)IDC_EDIT_FLAME_VALUE, GetModuleHandle(NULL), NULL);
             EnableWindow(g_hEditFlameValue, FALSE);
-            CreateWindowEx(0, "BUTTON", "Set", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                current_button_x, y_pos, currency_button_width, control_height, hDlg, (HMENU)IDC_BTN_SET_FLAME, GetModuleHandle(NULL), NULL);
-            y_pos += control_height + spacing_y;
+            CreateWindowEx(0, "BUTTON", "Set",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                0, 0, 0, 0, hDlg,
+                (HMENU)IDC_BTN_SET_FLAME, GetModuleHandle(NULL), NULL);
 
-            CreateWindowEx(WS_EX_TRANSPARENT, "STATIC", "Follower Count:", WS_CHILD | WS_VISIBLE,
-                current_label_x, y_pos, label_width, control_height, hDlg, (HMENU)IDC_STATIC_FOLLOWER_LABEL, GetModuleHandle(NULL), NULL);
-            g_hEditFollowerValue = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_AUTOHSCROLL,
-                current_value_x, y_pos, value_width, control_height, hDlg, (HMENU)IDC_EDIT_FOLLOWER_VALUE, GetModuleHandle(NULL), NULL);
+            // Follower Count
+            g_hLblFollower = CreateWindowEx(WS_EX_TRANSPARENT, "STATIC", "Follower Count",
+                WS_CHILD | WS_VISIBLE | SS_LEFT,
+                0, 0, 0, 0, hDlg,
+                (HMENU)IDC_STATIC_FOLLOWER_LABEL, GetModuleHandle(NULL), NULL);
+            g_hEditFollowerValue = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "",
+                WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_AUTOHSCROLL,
+                0, 0, 0, 0, hDlg,
+                (HMENU)IDC_EDIT_FOLLOWER_VALUE, GetModuleHandle(NULL), NULL);
             EnableWindow(g_hEditFollowerValue, FALSE);
-            CreateWindowEx(0, "BUTTON", "Set", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                current_button_x, y_pos, currency_button_width, control_height, hDlg, (HMENU)IDC_BTN_SET_FOLLOWER, GetModuleHandle(NULL), NULL);
-            y_pos += control_height + section_spacing_y;
+            CreateWindowEx(0, "BUTTON", "Set",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                0, 0, 0, 0, hDlg,
+                (HMENU)IDC_BTN_SET_FOLLOWER, GetModuleHandle(NULL), NULL);
 
-            // Create Ingredient UI Elements.
-            int ing_x_start = (dialog_client_width - ingredient_row_total_width) / 2;
-            // (Max Own/All ingredient buttons removed – use the per-ingredient editor below.)
+            // --- Section 2: Ingredients group box ---
+            g_hGbIngredients = CreateWindowEx(0, "BUTTON", "Ingredients",
+                WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+                0, 0, 0, 0,
+                hDlg, NULL, GetModuleHandle(NULL), NULL);
 
-            int combo_width = 180;
-            int amount_width = 60;
-            int set_btn_width = 80;
-            int manual_row_total = combo_width + amount_width + set_btn_width + 20;
-            int manual_x_start = (dialog_client_width - manual_row_total) / 2;
-
-            // Search filter box — user types here to narrow the ingredient combo below.
-            g_hEditIngSearch = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "Search...",
+            // Search box — placeholder cleared on EN_SETFOCUS, restored on EN_KILLFOCUS if empty.
+            g_hEditIngSearch = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "",
                 WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-                manual_x_start, y_pos, combo_width, control_height, hDlg, (HMENU)IDC_EDIT_ING_SEARCH, GetModuleHandle(NULL), NULL);
-            y_pos += control_height + spacing_y; // Advance past the search box.
+                0, 0, 0, 0,
+                hDlg, (HMENU)IDC_EDIT_ING_SEARCH, GetModuleHandle(NULL), NULL);
+            SetWindowTextA(g_hEditIngSearch, "Search...");
 
+            // Combo + amount edit + Set button
             g_hComboIngredients = CreateWindowEx(0, "COMBOBOX", "",
                 WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-                manual_x_start, y_pos, combo_width, 200, hDlg, (HMENU)IDC_COMBO_INGREDIENTS, GetModuleHandle(NULL), NULL);
+                0, 0, 0, 200,
+                hDlg, (HMENU)IDC_COMBO_INGREDIENTS, GetModuleHandle(NULL), NULL);
 
             g_hEditIngAmount = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "1",
-                WS_CHILD | WS_VISIBLE | ES_NUMBER,
-                manual_x_start + combo_width + 10, y_pos, amount_width, control_height, hDlg, (HMENU)IDC_EDIT_ING_AMOUNT, GetModuleHandle(NULL), NULL);
+                WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_AUTOHSCROLL,
+                0, 0, 0, 0,
+                hDlg, (HMENU)IDC_EDIT_ING_AMOUNT, GetModuleHandle(NULL), NULL);
 
             CreateWindowEx(0, "BUTTON", "Set",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                manual_x_start + combo_width + amount_width + 20, y_pos, set_btn_width, control_height, hDlg, (HMENU)IDC_BTN_SET_ING_AMOUNT, GetModuleHandle(NULL), NULL);
+                0, 0, 0, 0,
+                hDlg, (HMENU)IDC_BTN_SET_ING_AMOUNT, GetModuleHandle(NULL), NULL);
 
-            // Populate g_ingredientList from the Reference DB (cached for fast filtering).
-            // Display string uses ItemTextID as the readable name: "ID - ItemTextID".
+            // Populate ingredient combo from reference DB.
             if (g_refDb) {
                 sqlite3_stmt* pStmt;
                 const char* sql = "SELECT I.TID, T.ItemTextID FROM Ingredients I JOIN Items T ON I.TID = T.ItemDataID ORDER BY I.TID ASC";
@@ -445,21 +567,48 @@ INT_PTR CALLBACK DialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPara
                     }
                     sqlite3_finalize(pStmt);
                 }
-                // Load full unfiltered list into the combo on startup.
                 for (const auto& entry : g_ingredientList) {
                     int index = ComboBox_AddString(g_hComboIngredients, entry.second.c_str());
                     ComboBox_SetItemData(g_hComboIngredients, index, entry.first);
                 }
             }
 
-            // Create File Operation UI Elements.
-            y_pos += control_height + section_spacing_y; // Advance past the ingredient scan row.
-            int file_x_start = (dialog_client_width - file_row_total_width) / 2;
+            // --- Section 3: File operation buttons ---
+            g_hBtnLoadSave = CreateWindowEx(0, "BUTTON", "Load Save File...",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                0, 0, 0, 0,
+                hDlg, (HMENU)IDC_BTN_LOAD_SAVE, GetModuleHandle(NULL), NULL);
 
-            CreateWindowEx(0, "BUTTON", "Load Save File...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                file_x_start, y_pos, file_btn_width, control_height + 5, hDlg, (HMENU)IDC_BTN_LOAD_SAVE, GetModuleHandle(NULL), NULL);
-            CreateWindowEx(0, "BUTTON", "Write Save File", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                file_x_start + file_btn_width + file_btn_spacing, y_pos, file_btn_width, control_height + 5, hDlg, (HMENU)IDC_BTN_WRITE_SAVE, GetModuleHandle(NULL), NULL);
+            g_hBtnWriteSave = CreateWindowEx(0, "BUTTON", "Write Save File",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                0, 0, 0, 0,
+                hDlg, (HMENU)IDC_BTN_WRITE_SAVE, GetModuleHandle(NULL), NULL);
+            EnableWindow(g_hBtnWriteSave, FALSE);
+
+            // --- Status bar (bottom strip) ---
+            g_hStatusBar = CreateWindowEx(0, "STATIC", "  No save file loaded.",
+                WS_CHILD | WS_VISIBLE | SS_LEFT,
+                0, 0, 0, 0,
+                hDlg, NULL, GetModuleHandle(NULL), NULL);
+
+            // --- Apply fonts to all controls ---
+            EnumChildWindows(hDlg, SetChildFont, (LPARAM)g_hFont);
+            // Override group box titles and section headers with bold font.
+            EnumChildWindows(hDlg, [](HWND hChild, LPARAM lParam) -> BOOL {
+                char cls[32] = {};
+                GetClassNameA(hChild, cls, sizeof(cls));
+                if (lstrcmpiA(cls, "BUTTON") == 0) {
+                    LONG style = GetWindowLong(hChild, GWL_STYLE);
+                    if ((style & BS_TYPEMASK) == BS_GROUPBOX)
+                        SendMessage(hChild, WM_SETFONT, (WPARAM)(HFONT)lParam, TRUE);
+                }
+                return TRUE;
+            }, (LPARAM)g_hFontBold);
+            // Small font for status bar.
+            if (g_hStatusBar) SendMessage(g_hStatusBar, WM_SETFONT, (WPARAM)g_hFontSmall, TRUE);
+
+            // Initial layout pass — positions all controls based on current client size.
+            DoLayout(hDlg, W, H);
 
             return 0;
         }
@@ -522,17 +671,28 @@ INT_PTR CALLBACK DialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPara
                     break;
                 }
                 case IDC_EDIT_ING_SEARCH:
-                    // Re-populate the combo with entries that contain the search text.
-                    if (HIWORD(wParam) == EN_CHANGE) {
+                    if (HIWORD(wParam) == EN_SETFOCUS) {
+                        // Clear the placeholder text when the user clicks into the box.
+                        char buf[4] = {};
+                        GetWindowTextA(g_hEditIngSearch, buf, sizeof(buf));
+                        if (lstrcmpiA(buf, "Search...") == 0)
+                            SetWindowTextA(g_hEditIngSearch, "");
+                    } else if (HIWORD(wParam) == EN_KILLFOCUS) {
+                        // Restore placeholder if the box is left empty.
+                        char buf[4] = {};
+                        GetWindowTextA(g_hEditIngSearch, buf, sizeof(buf));
+                        if (buf[0] == '\0')
+                            SetWindowTextA(g_hEditIngSearch, "Search...");
+                    } else if (HIWORD(wParam) == EN_CHANGE) {
                         char searchBuf[128] = {0};
                         GetWindowTextA(g_hEditIngSearch, searchBuf, sizeof(searchBuf));
                         std::string filter(searchBuf);
+                        // Don't filter on the placeholder text itself.
+                        if (filter == "Search...") filter = "";
 
-                        // Build lowercase version of the filter for case-insensitive matching.
                         std::string filterLower = filter;
                         for (char& c : filterLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
 
-                        // Rebuild the combo contents to match the current filter.
                         ComboBox_ResetContent(g_hComboIngredients);
                         for (const auto& entry : g_ingredientList) {
                             std::string dispLower = entry.second;
@@ -645,6 +805,22 @@ INT_PTR CALLBACK DialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPara
             return 0;
         }
         
+        case WM_SIZE: {
+            int newW = LOWORD(lParam);
+            int newH = HIWORD(lParam);
+            if (wParam != SIZE_MINIMIZED && newW > 0 && newH > 0)
+                DoLayout(hDlg, newW, newH);
+            return 0;
+        }
+
+        case WM_GETMINMAXINFO: {
+            // Enforce a minimum window size so controls never get crushed.
+            MINMAXINFO* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
+            mmi->ptMinTrackSize.x = 420;
+            mmi->ptMinTrackSize.y = 380;
+            return 0;
+        }
+
         case WM_CLOSE:
             LogMessage(LOG_INFO_LEVEL, "WM_CLOSE received. Destroying window.");
             DestroyWindow(hDlg); // Destroy the window.
@@ -652,20 +828,37 @@ INT_PTR CALLBACK DialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPara
 
         case WM_DESTROY:
             LogMessage(LOG_INFO_LEVEL, "WM_DESTROY received. Posting quit message.");
-            // Close the reference database if it's open.
             if (g_refDb) {
                 sqlite3_close(g_refDb);
                 g_refDb = NULL;
                 LogMessage(LOG_INFO_LEVEL, "Reference database closed.");
             }
-            PostQuitMessage(0); // Signal the application to exit the message loop.
+            if (g_hFont)      { DeleteObject(g_hFont);      g_hFont      = NULL; }
+            if (g_hFontBold)  { DeleteObject(g_hFontBold);  g_hFontBold  = NULL; }
+            if (g_hFontSmall) { DeleteObject(g_hFontSmall); g_hFontSmall = NULL; }
+            PostQuitMessage(0);
             return 0;
 
         case WM_CTLCOLORSTATIC: {
-            // Custom drawing for static controls to ensure transparent background with the dialog's brush.
             HDC hdcStatic = (HDC)wParam;
-            SetBkMode(hdcStatic, TRANSPARENT); // Set background mode to transparent.
-            return (INT_PTR)g_hBackgroundBrush; // Return the brush for the dialog background.
+            HWND hCtrl    = (HWND)lParam;
+            SetBkMode(hdcStatic, TRANSPARENT);
+            // Status bar gets a slightly darker tint to visually separate it.
+            if (hCtrl == g_hStatusBar) {
+                SetTextColor(hdcStatic, RGB(90, 90, 90));
+                static HBRUSH hSbarBrush = CreateSolidBrush(RGB(225, 225, 225));
+                return (INT_PTR)hSbarBrush;
+            }
+            return (INT_PTR)g_hBackgroundBrush;
+        }
+
+        case WM_CTLCOLOREDIT: {
+            // Keep edit controls white regardless of dialog background.
+            HDC hdcEdit = (HDC)wParam;
+            SetBkColor(hdcEdit, RGB(255, 255, 255));
+            SetTextColor(hdcEdit, RGB(30, 30, 30));
+            static HBRUSH hWhiteBrush = (HBRUSH)GetStockObject(WHITE_BRUSH);
+            return (INT_PTR)hWhiteBrush;
         }
 
         default:
