@@ -20,13 +20,14 @@ The easiest way to use DaveSaveEd is to download the pre-compiled executable.
 
 ## Features
 
-* **Currency Editing:** Easily maximize Gold, Bei, and Artisan's Flame.
+* **Currency Editing:** Manually set specific values for Gold, Bei, and Artisan's Flame.
 * **Ingredient Management:**
-    * Maximize quantities of ingredients you already own.
-    * Add and maximize quantities for all known ingredients in the game.
+    * Search Bar: Quickly find specific ingredients using the new search interface.
+    * Custom Quantities: Edit quantities for searched ingredients.
 * **Cross-Platform Support:** Automatically detects both Steam and Xbox/Windows Store save files.
 * **Smart Suggestion:** Defaults to the most recently modified save file across all detected platforms.
 * **Automatic Backups:** Creates a backup of your original save before writing any changes.
+* **UI Update:** Slight UI update an reactivity was implemented.
 
 ## Running the Application (Pre-built)
 
