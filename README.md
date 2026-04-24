@@ -1,6 +1,10 @@
 # DaveSaveEd - Dave the Diver Save Editor
 
 ![DaveSaveEd Banner](images/davesaveed_banner.png)
+> [!IMPORTANT]
+> This is a fork of the original DaveSaveEd. This version adds a UI update, a search bar for ingredients, and the ability to set specific custom values for all currencies and items. 
+> 
+> *Please note: These changes were implemented in just a few hours for my own needs and have not been thoroughly tested. Use with caution and always keep a manual backup of your saves.*
 
 A fan-made, open-source save editor for the game *Dave the Diver*. This tool allows players to modify certain aspects of their save game data, such as currency amounts and ingredient quantities.
 
