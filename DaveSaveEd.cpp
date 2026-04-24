@@ -35,6 +35,7 @@
 #include <filesystem>   // For std::filesystem (C++17 for path manipulation) - Kept for std::filesystem::path
 #include <string.h>     // For strstr (for parsing command-line arguments)
 #include <vector>       // For std::vector (used in zlib decompression)
+#include <cctype>       // For std::tolower (used in ingredient search filter)
 
 // Include SQLite3 header
 #include "sqlite3.h"
@@ -56,24 +57,20 @@
 
 // Control IDs for currency-related UI elements.
 #define IDC_STATIC_GOLD_LABEL       101
-#define IDC_STATIC_GOLD_VALUE       102
-#define IDC_BTN_MAX_GOLD            103
+#define IDC_EDIT_GOLD_VALUE         102
+#define IDC_BTN_SET_GOLD            103
 
 #define IDC_STATIC_BEI_LABEL        104
-#define IDC_STATIC_BEI_VALUE        105
-#define IDC_BTN_MAX_BEI             106
+#define IDC_EDIT_BEI_VALUE          105
+#define IDC_BTN_SET_BEI             106
 
 #define IDC_STATIC_FLAME_LABEL      107
-#define IDC_STATIC_FLAME_VALUE      108
-#define IDC_BTN_MAX_FLAME           109
+#define IDC_EDIT_FLAME_VALUE        108
+#define IDC_BTN_SET_FLAME           109
 
 #define IDC_STATIC_FOLLOWER_LABEL   114
-#define IDC_STATIC_FOLLOWER_VALUE   115
-#define IDC_BTN_MAX_FOLLOWER        116
-
-// Control IDs for ingredient-related UI elements.
-#define IDC_BTN_MAX_OWN_INGREDIENTS 110
-#define IDC_BTN_MAX_ALL_INGREDIENTS 111
+#define IDC_EDIT_FOLLOWER_VALUE     115
+#define IDC_BTN_SET_FOLLOWER        116
 
 // Control IDs for file operation UI elements.
 #define IDC_BTN_LOAD_SAVE           112
@@ -82,18 +79,24 @@
 #define IDC_COMBO_INGREDIENTS       117
 #define IDC_EDIT_ING_AMOUNT         118
 #define IDC_BTN_SET_ING_AMOUNT      119
+#define IDC_EDIT_ING_SEARCH         120
 
 // --- Global Window Handles ---
 HWND g_hDlg = NULL; // Handle to the main dialog window.
 
 HWND g_hComboIngredients = NULL;
 HWND g_hEditIngAmount = NULL;
+HWND g_hEditIngSearch = NULL;
 
-// Handles to the static text controls that display currency values.
-HWND g_hStaticGoldValue = NULL;
-HWND g_hStaticBeiValue = NULL;
-HWND g_hStaticFlameValue = NULL;
-HWND g_hStaticFollowerValue = NULL;
+// Full ingredient list cached at startup for fast combo filtering.
+// Each entry is { ingredientID, "ID - TextID" display string }.
+std::vector<std::pair<int, std::string>> g_ingredientList;
+
+// Handles to the edit controls that display and accept currency values.
+HWND g_hEditGoldValue = NULL;
+HWND g_hEditBeiValue = NULL;
+HWND g_hEditFlameValue = NULL;
+HWND g_hEditFollowerValue = NULL;
 
 // --- Global SQLite Database Handle (for embedded reference DB) ---
 // This database stores reference data (e.g., ingredient lists) for the editor.
@@ -112,31 +115,32 @@ INT_PTR CALLBACK DialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPara
 // Function to update the currency display on the UI from the loaded save data.
 void UpdateCurrencyDisplay();
 
-// --- Function to update currency static text fields ---
+// --- Function to update currency edit fields ---
 // Retrieves currency values from the SaveGameManager and updates the corresponding UI controls.
 void UpdateCurrencyDisplay() {
-    // Initialize display strings to blank.
-    std::string gold_str = "";
-    std::string bei_str = "";
-    std::string flame_str = "";
-    std::string follower_str = "";
-
-    // If a save file is loaded, retrieve and display the actual values.
     if (g_saveGameManager.IsSaveFileLoaded()) {
-        gold_str = std::to_string(g_saveGameManager.GetGold());
-        bei_str = std::to_string(g_saveGameManager.GetBei());
-        flame_str = std::to_string(g_saveGameManager.GetArtisansFlame());
-        follower_str = std::to_string(g_saveGameManager.GetFollowerCount());
+        SetWindowTextA(g_hEditGoldValue,     std::to_string(g_saveGameManager.GetGold()).c_str());
+        SetWindowTextA(g_hEditBeiValue,      std::to_string(g_saveGameManager.GetBei()).c_str());
+        SetWindowTextA(g_hEditFlameValue,    std::to_string(g_saveGameManager.GetArtisansFlame()).c_str());
+        SetWindowTextA(g_hEditFollowerValue, std::to_string(g_saveGameManager.GetFollowerCount()).c_str());
+        // Enable editing now that a save is loaded.
+        EnableWindow(g_hEditGoldValue,     TRUE);
+        EnableWindow(g_hEditBeiValue,      TRUE);
+        EnableWindow(g_hEditFlameValue,    TRUE);
+        EnableWindow(g_hEditFollowerValue, TRUE);
         LogMessage(LOG_INFO_LEVEL, "Currency display updated from SaveGameManager values.");
     } else {
+        SetWindowTextA(g_hEditGoldValue,     "");
+        SetWindowTextA(g_hEditBeiValue,      "");
+        SetWindowTextA(g_hEditFlameValue,    "");
+        SetWindowTextA(g_hEditFollowerValue, "");
+        // Disable editing until a save is loaded.
+        EnableWindow(g_hEditGoldValue,     FALSE);
+        EnableWindow(g_hEditBeiValue,      FALSE);
+        EnableWindow(g_hEditFlameValue,    FALSE);
+        EnableWindow(g_hEditFollowerValue, FALSE);
         LogMessage(LOG_INFO_LEVEL, "No valid save data loaded. Displaying blank currency values.");
     }
-
-    // Set the text of the static controls.
-    SetWindowTextA(g_hStaticGoldValue, gold_str.c_str());
-    SetWindowTextA(g_hStaticBeiValue, bei_str.c_str());
-    SetWindowTextA(g_hStaticFlameValue, flame_str.c_str());
-    SetWindowTextA(g_hStaticFollowerValue, follower_str.c_str());
 }
 
 // --- Entry Point: WinMain ---
@@ -185,7 +189,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         "DaveSaveEd",                       // NEW: Window title changed to "DaveSaveEd".
         WS_OVERLAPPEDWINDOW | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, // Window styles.
         CW_USEDEFAULT, CW_USEDEFAULT,       // Default position.
-        450, 400,                           // Initial size (height increased to fit ingredient scan row).
+        450, 360,                           // Initial size (height reduced after removing max-ingredient buttons).
         NULL,                               // Parent window.
         NULL,                               // Menu handle.
         hInstance,                          // Application instance.
@@ -246,11 +250,8 @@ INT_PTR CALLBACK DialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPara
             g_hDlg = hDlg; // Store the dialog handle globally.
             LogMessage(LOG_INFO_LEVEL, "WM_CREATE received. Initializing UI and Reference Database.");
 
-            // Initialize currency display fields to blank.
-            SetWindowTextA(g_hStaticGoldValue, "");
-            SetWindowTextA(g_hStaticBeiValue, "");
-            SetWindowTextA(g_hStaticFlameValue, "");
-            SetWindowTextA(g_hStaticFollowerValue, "");
+            // Initialize currency edit fields to blank and disabled until a save is loaded.
+            // (Handles are set during control creation below.)
 
             // --- Reference Database Initialization (from embedded_sql.h) ---
             // Opens an in-memory SQLite database and populates it from compressed SQL data.
@@ -341,12 +342,13 @@ INT_PTR CALLBACK DialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPara
 
             // Calculate total height needed for all UI blocks.
             int total_currency_block_height = (control_height * 4) + (spacing_y * 3);
-            int total_ingredient_block_height = control_height;
-            int total_ingredient_scan_height = control_height; // Combo/edit/set row for individual ingredient editing.
-            int total_file_block_height = control_height + 5; // +5 for slight extra spacing.
+            // No separate max-ingredient button row any more.
+            int total_ingredient_search_height = control_height; // Search filter box above the combo.
+            int total_ingredient_scan_height = control_height;   // Combo/edit/set row for individual editing.
+            int total_file_block_height = control_height + 5;    // +5 for slight extra spacing.
 
             int total_ui_elements_height = total_currency_block_height + section_spacing_y +
-                                           total_ingredient_block_height + section_spacing_y +
+                                           total_ingredient_search_height + spacing_y +
                                            total_ingredient_scan_height + section_spacing_y +
                                            total_file_block_height;
 
@@ -363,47 +365,46 @@ INT_PTR CALLBACK DialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPara
             int current_button_x = current_value_x + value_width + spacing_x_currency_row;
 
             // Create Currency UI Elements.
+            // Each row: label | editable value (ES_NUMBER) | "Set" button
             CreateWindowEx(WS_EX_TRANSPARENT, "STATIC", "Gold:", WS_CHILD | WS_VISIBLE,
                 current_label_x, y_pos, label_width, control_height, hDlg, (HMENU)IDC_STATIC_GOLD_LABEL, GetModuleHandle(NULL), NULL);
-            g_hStaticGoldValue = CreateWindowEx(0, "STATIC", "", WS_CHILD | WS_VISIBLE | SS_CENTER | SS_ENDELLIPSIS,
-                current_value_x, y_pos, value_width, control_height, hDlg, (HMENU)IDC_STATIC_GOLD_VALUE, GetModuleHandle(NULL), NULL);
-            CreateWindowEx(0, "BUTTON", "Set to Max", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                current_button_x, y_pos, currency_button_width, control_height, hDlg, (HMENU)IDC_BTN_MAX_GOLD, GetModuleHandle(NULL), NULL);
+            g_hEditGoldValue = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_AUTOHSCROLL,
+                current_value_x, y_pos, value_width, control_height, hDlg, (HMENU)IDC_EDIT_GOLD_VALUE, GetModuleHandle(NULL), NULL);
+            EnableWindow(g_hEditGoldValue, FALSE);
+            CreateWindowEx(0, "BUTTON", "Set", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                current_button_x, y_pos, currency_button_width, control_height, hDlg, (HMENU)IDC_BTN_SET_GOLD, GetModuleHandle(NULL), NULL);
             y_pos += control_height + spacing_y;
 
             CreateWindowEx(WS_EX_TRANSPARENT, "STATIC", "Bei:", WS_CHILD | WS_VISIBLE,
                 current_label_x, y_pos, label_width, control_height, hDlg, (HMENU)IDC_STATIC_BEI_LABEL, GetModuleHandle(NULL), NULL);
-            g_hStaticBeiValue = CreateWindowEx(0, "STATIC", "", WS_CHILD | WS_VISIBLE | SS_CENTER | SS_ENDELLIPSIS,
-                current_value_x, y_pos, value_width, control_height, hDlg, (HMENU)IDC_STATIC_BEI_VALUE, GetModuleHandle(NULL), NULL);
-            CreateWindowEx(0, "BUTTON", "Set to Max", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                current_button_x, y_pos, currency_button_width, control_height, hDlg, (HMENU)IDC_BTN_MAX_BEI, GetModuleHandle(NULL), NULL);
+            g_hEditBeiValue = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_AUTOHSCROLL,
+                current_value_x, y_pos, value_width, control_height, hDlg, (HMENU)IDC_EDIT_BEI_VALUE, GetModuleHandle(NULL), NULL);
+            EnableWindow(g_hEditBeiValue, FALSE);
+            CreateWindowEx(0, "BUTTON", "Set", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                current_button_x, y_pos, currency_button_width, control_height, hDlg, (HMENU)IDC_BTN_SET_BEI, GetModuleHandle(NULL), NULL);
             y_pos += control_height + spacing_y;
 
             CreateWindowEx(WS_EX_TRANSPARENT, "STATIC", "Artisan's Flame:", WS_CHILD | WS_VISIBLE,
                 current_label_x, y_pos, label_width, control_height, hDlg, (HMENU)IDC_STATIC_FLAME_LABEL, GetModuleHandle(NULL), NULL);
-            g_hStaticFlameValue = CreateWindowEx(0, "STATIC", "", WS_CHILD | WS_VISIBLE | SS_CENTER | SS_ENDELLIPSIS,
-                current_value_x, y_pos, value_width, control_height, hDlg, (HMENU)IDC_STATIC_FLAME_VALUE, GetModuleHandle(NULL), NULL);
-            CreateWindowEx(0, "BUTTON", "Set to Max", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                current_button_x, y_pos, currency_button_width, control_height, hDlg, (HMENU)IDC_BTN_MAX_FLAME, GetModuleHandle(NULL), NULL);
+            g_hEditFlameValue = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_AUTOHSCROLL,
+                current_value_x, y_pos, value_width, control_height, hDlg, (HMENU)IDC_EDIT_FLAME_VALUE, GetModuleHandle(NULL), NULL);
+            EnableWindow(g_hEditFlameValue, FALSE);
+            CreateWindowEx(0, "BUTTON", "Set", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                current_button_x, y_pos, currency_button_width, control_height, hDlg, (HMENU)IDC_BTN_SET_FLAME, GetModuleHandle(NULL), NULL);
             y_pos += control_height + spacing_y;
 
             CreateWindowEx(WS_EX_TRANSPARENT, "STATIC", "Follower Count:", WS_CHILD | WS_VISIBLE,
                 current_label_x, y_pos, label_width, control_height, hDlg, (HMENU)IDC_STATIC_FOLLOWER_LABEL, GetModuleHandle(NULL), NULL);
-            g_hStaticFollowerValue = CreateWindowEx(0, "STATIC", "", WS_CHILD | WS_VISIBLE | SS_CENTER | SS_ENDELLIPSIS,
-                current_value_x, y_pos, value_width, control_height, hDlg, (HMENU)IDC_STATIC_FOLLOWER_VALUE, GetModuleHandle(NULL), NULL);
-            CreateWindowEx(0, "BUTTON", "Set to Max", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                current_button_x, y_pos, currency_button_width, control_height, hDlg, (HMENU)IDC_BTN_MAX_FOLLOWER, GetModuleHandle(NULL), NULL);
+            g_hEditFollowerValue = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_AUTOHSCROLL,
+                current_value_x, y_pos, value_width, control_height, hDlg, (HMENU)IDC_EDIT_FOLLOWER_VALUE, GetModuleHandle(NULL), NULL);
+            EnableWindow(g_hEditFollowerValue, FALSE);
+            CreateWindowEx(0, "BUTTON", "Set", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                current_button_x, y_pos, currency_button_width, control_height, hDlg, (HMENU)IDC_BTN_SET_FOLLOWER, GetModuleHandle(NULL), NULL);
             y_pos += control_height + section_spacing_y;
-
 
             // Create Ingredient UI Elements.
             int ing_x_start = (dialog_client_width - ingredient_row_total_width) / 2;
-
-            CreateWindowEx(0, "BUTTON", "Max Own Ingredients", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                ing_x_start, y_pos, ing_btn_width, control_height, hDlg, (HMENU)IDC_BTN_MAX_OWN_INGREDIENTS, GetModuleHandle(NULL), NULL);
-            CreateWindowEx(0, "BUTTON", "Max All Ingredients", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                ing_x_start + ing_btn_width + ing_btn_spacing, y_pos, ing_btn_width, control_height, hDlg, (HMENU)IDC_BTN_MAX_ALL_INGREDIENTS, GetModuleHandle(NULL), NULL);
-            y_pos += control_height + section_spacing_y;
+            // (Max Own/All ingredient buttons removed – use the per-ingredient editor below.)
 
             int combo_width = 180;
             int amount_width = 60;
@@ -411,33 +412,43 @@ INT_PTR CALLBACK DialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPara
             int manual_row_total = combo_width + amount_width + set_btn_width + 20;
             int manual_x_start = (dialog_client_width - manual_row_total) / 2;
 
-            g_hComboIngredients = CreateWindowEx(0, "COMBOBOX", "", 
+            // Search filter box — user types here to narrow the ingredient combo below.
+            g_hEditIngSearch = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "Search...",
+                WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+                manual_x_start, y_pos, combo_width, control_height, hDlg, (HMENU)IDC_EDIT_ING_SEARCH, GetModuleHandle(NULL), NULL);
+            y_pos += control_height + spacing_y; // Advance past the search box.
+
+            g_hComboIngredients = CreateWindowEx(0, "COMBOBOX", "",
                 WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
                 manual_x_start, y_pos, combo_width, 200, hDlg, (HMENU)IDC_COMBO_INGREDIENTS, GetModuleHandle(NULL), NULL);
 
-            g_hEditIngAmount = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "1", 
+            g_hEditIngAmount = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "1",
                 WS_CHILD | WS_VISIBLE | ES_NUMBER,
                 manual_x_start + combo_width + 10, y_pos, amount_width, control_height, hDlg, (HMENU)IDC_EDIT_ING_AMOUNT, GetModuleHandle(NULL), NULL);
 
-            CreateWindowEx(0, "BUTTON", "Set", 
+            CreateWindowEx(0, "BUTTON", "Set",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                 manual_x_start + combo_width + amount_width + 20, y_pos, set_btn_width, control_height, hDlg, (HMENU)IDC_BTN_SET_ING_AMOUNT, GetModuleHandle(NULL), NULL);
 
-            // Populate the ComboBox from the Reference DB.
-            // The reference DB has no display-name column, so entries show the numeric ingredient ID.
-            // The raw ID is also stored as item data so the Set handler can retrieve it directly.
+            // Populate g_ingredientList from the Reference DB (cached for fast filtering).
+            // Display string uses ItemTextID as the readable name: "ID - ItemTextID".
             if (g_refDb) {
                 sqlite3_stmt* pStmt;
-                const char* sql = "SELECT I.TID FROM Ingredients I JOIN Items T ON I.TID = T.ItemDataID ORDER BY I.TID ASC";
+                const char* sql = "SELECT I.TID, T.ItemTextID FROM Ingredients I JOIN Items T ON I.TID = T.ItemDataID ORDER BY I.TID ASC";
                 if (sqlite3_prepare_v2(g_refDb, sql, -1, &pStmt, NULL) == SQLITE_OK) {
                     while (sqlite3_step(pStmt) == SQLITE_ROW) {
                         int id = sqlite3_column_int(pStmt, 0);
-                        std::string idStr = std::to_string(id);
-                        int index = ComboBox_AddString(g_hComboIngredients, idStr.c_str());
-                        // Store the raw ID so the Set handler can retrieve it without re-parsing the string.
-                        ComboBox_SetItemData(g_hComboIngredients, index, id);
+                        const char* rawText = reinterpret_cast<const char*>(sqlite3_column_text(pStmt, 1));
+                        std::string textID = rawText ? rawText : "";
+                        std::string displayStr = std::to_string(id) + " - " + textID;
+                        g_ingredientList.emplace_back(id, displayStr);
                     }
                     sqlite3_finalize(pStmt);
+                }
+                // Load full unfiltered list into the combo on startup.
+                for (const auto& entry : g_ingredientList) {
+                    int index = ComboBox_AddString(g_hComboIngredients, entry.second.c_str());
+                    ComboBox_SetItemData(g_hComboIngredients, index, entry.first);
                 }
             }
 
@@ -458,63 +469,82 @@ INT_PTR CALLBACK DialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPara
             WORD controlId = GET_WM_COMMAND_ID(wParam, lParam);
 
             switch (controlId) {
-                case IDC_BTN_MAX_GOLD:
-                    LogMessage(LOG_INFO_LEVEL, "Max Gold button clicked.");
+                case IDC_BTN_SET_GOLD: {
+                    LogMessage(LOG_INFO_LEVEL, "Set Gold button clicked.");
                     if (g_saveGameManager.IsSaveFileLoaded()) {
-                        g_saveGameManager.SetGold(999999999); // Set gold to max value.
-                        UpdateCurrencyDisplay(); // Refresh UI.
+                        char buf[32] = {0};
+                        GetWindowTextA(g_hEditGoldValue, buf, sizeof(buf));
+                        long long value = _atoi64(buf);
+                        g_saveGameManager.SetGold(value); // Clamped to max inside setter.
+                        UpdateCurrencyDisplay();           // Refresh to show clamped value.
                     } else {
                         MessageBox(hDlg, "No save file loaded or valid data to modify!", "Error", MB_ICONWARNING | MB_OK);
-                        LogMessage(LOG_INFO_LEVEL, "Attempted to set max gold without a loaded save file.");
                     }
                     break;
-                case IDC_BTN_MAX_BEI:
-                    LogMessage(LOG_INFO_LEVEL, "Max Bei button clicked.");
+                }
+                case IDC_BTN_SET_BEI: {
+                    LogMessage(LOG_INFO_LEVEL, "Set Bei button clicked.");
                     if (g_saveGameManager.IsSaveFileLoaded()) {
-                        g_saveGameManager.SetBei(999999999); // Set Bei to max value.
-                        UpdateCurrencyDisplay(); // Refresh UI.
-                    } else {
-                        MessageBox(hDlg, "No save file loaded or valid data to modify!", "Error", MB_ICONWARNING | MB_OK);
-                        LogMessage(LOG_INFO_LEVEL, "Attempted to set max bei without a loaded save file.");
-                    }
-                    break;
-                case IDC_BTN_MAX_FLAME:
-                    LogMessage(LOG_INFO_LEVEL, "Max Artisan's Flame button clicked.");
-                    if (g_saveGameManager.IsSaveFileLoaded()) {
-                        g_saveGameManager.SetArtisansFlame(999999); // Set Artisan's Flame to max value.
-                        UpdateCurrencyDisplay(); // Refresh UI.
-                    } else {
-                        MessageBox(hDlg, "No save file loaded or valid data to modify!", "Error", MB_ICONWARNING | MB_OK);
-                        LogMessage(LOG_INFO_LEVEL, "Attempted to set max artisan's flame without a loaded save file.");
-                    }
-                    break;
-                case IDC_BTN_MAX_FOLLOWER:
-                    LogMessage(LOG_INFO_LEVEL, "Max Follower Count button clicked.");
-                    if (g_saveGameManager.IsSaveFileLoaded()) {
-                        g_saveGameManager.SetFollowerCount(99999);
+                        char buf[32] = {0};
+                        GetWindowTextA(g_hEditBeiValue, buf, sizeof(buf));
+                        long long value = _atoi64(buf);
+                        g_saveGameManager.SetBei(value);
                         UpdateCurrencyDisplay();
                     } else {
                         MessageBox(hDlg, "No save file loaded or valid data to modify!", "Error", MB_ICONWARNING | MB_OK);
                     }
                     break;
-                case IDC_BTN_MAX_OWN_INGREDIENTS:
-                    LogMessage(LOG_INFO_LEVEL, "Max Own Ingredients button clicked.");
+                }
+                case IDC_BTN_SET_FLAME: {
+                    LogMessage(LOG_INFO_LEVEL, "Set Artisan's Flame button clicked.");
                     if (g_saveGameManager.IsSaveFileLoaded()) {
-                        g_saveGameManager.MaxOwnIngredients(g_refDb); // Pass the reference DB
-                        // Update UI if any changes are visible (e.g., if ingredient counts were displayed).
+                        char buf[32] = {0};
+                        GetWindowTextA(g_hEditFlameValue, buf, sizeof(buf));
+                        long long value = _atoi64(buf);
+                        g_saveGameManager.SetArtisansFlame(value);
+                        UpdateCurrencyDisplay();
                     } else {
                         MessageBox(hDlg, "No save file loaded or valid data to modify!", "Error", MB_ICONWARNING | MB_OK);
                     }
                     break;
-                case IDC_BTN_MAX_ALL_INGREDIENTS:
-                    LogMessage(LOG_INFO_LEVEL, "Max All Ingredients button clicked.");
+                }
+                case IDC_BTN_SET_FOLLOWER: {
+                    LogMessage(LOG_INFO_LEVEL, "Set Follower Count button clicked.");
                     if (g_saveGameManager.IsSaveFileLoaded()) {
-                        g_saveGameManager.MaxAllIngredients(g_refDb); // Pass reference DB for ingredient data.
-                        // Update UI if any changes are visible.
+                        char buf[32] = {0};
+                        GetWindowTextA(g_hEditFollowerValue, buf, sizeof(buf));
+                        long long value = _atoi64(buf);
+                        g_saveGameManager.SetFollowerCount(value);
+                        UpdateCurrencyDisplay();
                     } else {
                         MessageBox(hDlg, "No save file loaded or valid data to modify!", "Error", MB_ICONWARNING | MB_OK);
                     }
                     break;
+                }
+                case IDC_EDIT_ING_SEARCH:
+                    // Re-populate the combo with entries that contain the search text.
+                    if (HIWORD(wParam) == EN_CHANGE) {
+                        char searchBuf[128] = {0};
+                        GetWindowTextA(g_hEditIngSearch, searchBuf, sizeof(searchBuf));
+                        std::string filter(searchBuf);
+
+                        // Build lowercase version of the filter for case-insensitive matching.
+                        std::string filterLower = filter;
+                        for (char& c : filterLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+                        // Rebuild the combo contents to match the current filter.
+                        ComboBox_ResetContent(g_hComboIngredients);
+                        for (const auto& entry : g_ingredientList) {
+                            std::string dispLower = entry.second;
+                            for (char& c : dispLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                            if (filterLower.empty() || dispLower.find(filterLower) != std::string::npos) {
+                                int index = ComboBox_AddString(g_hComboIngredients, entry.second.c_str());
+                                ComboBox_SetItemData(g_hComboIngredients, index, entry.first);
+                            }
+                        }
+                    }
+                    break;
+
                 case IDC_COMBO_INGREDIENTS:
                     // When the user picks a different ingredient, pre-fill the amount field
                     // with whatever count is already in the loaded save, or 0 if not present.

@@ -43,7 +43,9 @@
 #include <filesystem>    
 #include <regex>         
 
-const long long SAVE_MAX_CURRENCY = 999999999LL;
+const long long SAVE_MAX_CURRENCY    = 999999999LL;
+const long long SAVE_MAX_FLAME       = 999999LL;
+const long long SAVE_MAX_FOLLOWERS   = 99999LL;
 
 static const std::string BYPASS_PREFIX = "BYPASSED_HEX::";
 
@@ -402,8 +404,8 @@ long long SaveGameManager::GetFollowerCount() const {
 }
 void SaveGameManager::SetGold(long long value) { m_saveData["PlayerInfo"]["m_Gold"] = std::min(value, SAVE_MAX_CURRENCY); }
 void SaveGameManager::SetBei(long long value) { m_saveData["PlayerInfo"]["m_Bei"] = std::min(value, SAVE_MAX_CURRENCY); }
-void SaveGameManager::SetArtisansFlame(long long value) { m_saveData["PlayerInfo"]["m_ChefFlame"] = std::min(value, SAVE_MAX_CURRENCY); }
-void SaveGameManager::SetFollowerCount(long long value) { m_saveData["SNSInfo"]["m_Follow_Count"] = value; }
+void SaveGameManager::SetArtisansFlame(long long value) { m_saveData["PlayerInfo"]["m_ChefFlame"] = std::min(value, SAVE_MAX_FLAME); }
+void SaveGameManager::SetFollowerCount(long long value) { m_saveData["SNSInfo"]["m_Follow_Count"] = std::min(value, SAVE_MAX_FOLLOWERS); }
 
 // Returns the current count of a specific ingredient in the loaded save, or 0 if not present.
 int SaveGameManager::GetIngredientCount(int ingredientID) const {
@@ -416,80 +418,25 @@ int SaveGameManager::GetIngredientCount(int ingredientID) const {
     return 0;
 }
 
-// --- Ingredients Helpers ---
-static int GetDesiredMaxCountForTier(int item_db_max_count) {
-    if (item_db_max_count >= 9999) return 6666;
-    if (item_db_max_count >= 999) return 666;
-    if (item_db_max_count >= 99) return 66;
-    return 0;
-}
-
-void SaveGameManager::MaxOwnIngredients(sqlite3* db) {
-    if (!m_isSaveFileLoaded || !db) return;
-    sqlite3_stmt *stmt = nullptr;
-    sqlite3_prepare_v2(db, "SELECT MaxCount FROM Items WHERE ItemDataID = ?;", -1, &stmt, NULL);
-    
-    for (auto& item : m_saveData["Ingredients"].items()) {
-        if (item.value().contains("ingredientsID")) {
-             sqlite3_reset(stmt);
-             sqlite3_bind_int(stmt, 1, item.value()["ingredientsID"]);
-             if (sqlite3_step(stmt) == SQLITE_ROW) {
-                 int max = sqlite3_column_int(stmt, 0);
-                 int target = GetDesiredMaxCountForTier(max);
-                 if (target > 0) item.value()["count"] = target;
-             }
-        }
-    }
-    sqlite3_finalize(stmt);
-}
-
-void SaveGameManager::MaxAllIngredients(sqlite3* db) {
-    if (!m_isSaveFileLoaded || !db) return;
-    const std::map<int, int> dlcTypeToIdMap = { {1, 14252001}, {3, 14252201}, {5, 14252401} };
-    std::set<int> installedDlcIds;
-    if (m_saveData["GameInfo"]["installedDLCs"].is_array()) {
-        for (const auto& dlc : m_saveData["GameInfo"]["installedDLCs"]) installedDlcIds.insert(dlc.get<int>());
-    }
-
-    std::vector<std::map<std::string, int>> all_db_ingredients; 
-    sqlite3_stmt *stmt = nullptr;
-    const char* sql = "SELECT I.TID, T.TID as pID, T.MaxCount, T.DLCType FROM Ingredients I JOIN Items T ON I.TID = T.ItemDataID";
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return;
-
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        int id = sqlite3_column_int(stmt, 0);
-        int parent = sqlite3_column_int(stmt, 1);
-        int max = sqlite3_column_int(stmt, 2);
-        int dlc = sqlite3_column_int(stmt, 3);
-        
-        if (dlcTypeToIdMap.count(dlc) && !installedDlcIds.count(dlcTypeToIdMap.at(dlc))) continue;
-
-        int target = GetDesiredMaxCountForTier(max);
-        if (target == 0) continue;
-
-        std::string key = std::to_string(id);
-        if (m_saveData["Ingredients"].contains(key)) {
-            m_saveData["Ingredients"][key]["count"] = target;
-        } else {
-            // MUST USE ordered_json for new entries
-            ordered_json entry;
-            entry["ingredientsID"] = id;
-            entry["parentID"] = parent;
-            entry["count"] = target;
-            entry["level"] = 1;
-            entry["branchCount"] = 0;
-            entry["isNew"] = true;
-            entry["placeTagMask"] = 1;
-            entry["lastGainTime"] = "04/01/2025 12:34:56"; 
-            entry["lastGainGameTime"] = "10/03/2022 08:30:52";
-            m_saveData["Ingredients"][key] = entry;
-        }
-    }
-    sqlite3_finalize(stmt);
-}
-
 bool SaveGameManager::SetSpecificIngredient(int ingredientID, int amount, sqlite3* db) {
     if (!m_isSaveFileLoaded) return false;
+
+    // Clamp amount to the item's MaxCount from the reference DB (if available).
+    if (db && amount > 0) {
+        sqlite3_stmt* maxStmt = nullptr;
+        if (sqlite3_prepare_v2(db, "SELECT MaxCount FROM Items WHERE ItemDataID = ?;", -1, &maxStmt, NULL) == SQLITE_OK) {
+            sqlite3_bind_int(maxStmt, 1, ingredientID);
+            if (sqlite3_step(maxStmt) == SQLITE_ROW) {
+                int dbMax = sqlite3_column_int(maxStmt, 0);
+                if (dbMax > 0 && amount > dbMax) {
+                    LogMessage(LOG_WARNING_LEVEL, ("SetSpecificIngredient: amount clamped from " +
+                        std::to_string(amount) + " to DB max " + std::to_string(dbMax)).c_str());
+                    amount = dbMax;
+                }
+            }
+            sqlite3_finalize(maxStmt);
+        }
+    }
 
     std::string key = std::to_string(ingredientID);
     

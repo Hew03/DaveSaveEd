@@ -68,8 +68,6 @@ public:
     void SetFollowerCount(long long value);
 
     // Ingredient Modifications
-    void MaxOwnIngredients(sqlite3* db);
-    void MaxAllIngredients(sqlite3* db);
     bool SetSpecificIngredient(int ingredientID, int amount, sqlite3* db);
 
     // State
