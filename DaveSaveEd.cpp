@@ -132,6 +132,9 @@ HWND g_hLblBei      = NULL;
 HWND g_hLblFlame    = NULL;
 HWND g_hLblFollower = NULL;
 
+// Flag to suppress EN_CHANGE handling during programmatic placeholder text changes.
+bool g_bIgnoreIngSearchChange = false;
+
 // --- Forward Declarations ---
 INT_PTR CALLBACK DialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam);
 void UpdateCurrencyDisplay();
@@ -251,7 +254,11 @@ void DoLayout(HWND hDlg, int W, int H) {
     int iy = ing_gb_y + 22;
     Move(g_hEditIngSearch,                              ing_x,        iy, ING_COMBO_W, ROW_H);
     iy += ROW_H + ROW_GAP;
-    Move(g_hComboIngredients,                           ing_x,        iy, ING_COMBO_W, ROW_H);
+    int combo_y_abs     = iy;
+    int combo_max_drop  = H - SBAR_H - SEC_GAP - FILE_BTN_H - SEC_GAP - combo_y_abs;
+    if (combo_max_drop < ROW_H) combo_max_drop = ROW_H; // always at least one row tall
+    int combo_drop_h    = (combo_max_drop < 200) ? combo_max_drop : 200;
+    Move(g_hComboIngredients,                           ing_x,        iy, ING_COMBO_W, combo_drop_h);
     Move(g_hEditIngAmount,                              ing_edit_x,   iy, ING_EDIT_W,  ROW_H);
     Move(GetDlgItem(hDlg, IDC_BTN_SET_ING_AMOUNT),     ing_set_btn_x,iy, ING_BTN_W,   ROW_H);
 
@@ -535,7 +542,9 @@ INT_PTR CALLBACK DialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPara
                 WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
                 0, 0, 0, 0,
                 hDlg, (HMENU)IDC_EDIT_ING_SEARCH, GetModuleHandle(NULL), NULL);
+            g_bIgnoreIngSearchChange = true;
             SetWindowTextA(g_hEditIngSearch, "Search...");
+            g_bIgnoreIngSearchChange = false;
 
             // Combo + amount edit + Set button
             g_hComboIngredients = CreateWindowEx(0, "COMBOBOX", "",
@@ -673,17 +682,24 @@ INT_PTR CALLBACK DialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPara
                 case IDC_EDIT_ING_SEARCH:
                     if (HIWORD(wParam) == EN_SETFOCUS) {
                         // Clear the placeholder text when the user clicks into the box.
-                        char buf[4] = {};
+                        char buf[16] = {};
                         GetWindowTextA(g_hEditIngSearch, buf, sizeof(buf));
-                        if (lstrcmpiA(buf, "Search...") == 0)
+                        if (lstrcmpiA(buf, "Search...") == 0) {
+                            g_bIgnoreIngSearchChange = true;
                             SetWindowTextA(g_hEditIngSearch, "");
+                            g_bIgnoreIngSearchChange = false;
+                        }
                     } else if (HIWORD(wParam) == EN_KILLFOCUS) {
                         // Restore placeholder if the box is left empty.
                         char buf[4] = {};
                         GetWindowTextA(g_hEditIngSearch, buf, sizeof(buf));
-                        if (buf[0] == '\0')
+                        if (buf[0] == '\0') {
+                            g_bIgnoreIngSearchChange = true;
                             SetWindowTextA(g_hEditIngSearch, "Search...");
+                            g_bIgnoreIngSearchChange = false;
+                        }
                     } else if (HIWORD(wParam) == EN_CHANGE) {
+                        if (g_bIgnoreIngSearchChange) break;
                         char searchBuf[128] = {0};
                         GetWindowTextA(g_hEditIngSearch, searchBuf, sizeof(searchBuf));
                         std::string filter(searchBuf);
